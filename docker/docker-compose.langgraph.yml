@@ -1,0 +1,63 @@
+version: "3.8"
+
+services:
+  langgraph-postgres:
+    image: postgres:16-alpine
+    container_name: langgraph-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: langgraph_memory
+      POSTGRES_USER: langgraph
+      POSTGRES_PASSWORD: langgraph_password_change_me # CHANGE THIS IN PRODUCTION!
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    volumes:
+      - langgraph_postgres_data:/var/lib/postgresql/data
+
+    ports:
+      - "5432:5432" # Expose for external management (optional)
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langgraph -d langgraph_memory"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    networks:
+      - langgraph_network
+
+  # PgAdmin for database management (optional but recommended)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: langgraph-pgadmin
+    restart: unless-stopped
+
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin # CHANGE THIS IN PRODUCTION!
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+
+    ports:
+      - "5050:80"
+
+    volumes:
+      - langgraph_pgadmin_data:/var/lib/pgadmin
+
+    networks:
+      - langgraph_network
+
+    depends_on:
+      langgraph-postgres:
+        condition: service_healthy
+
+volumes:
+  langgraph_postgres_data:
+    driver: local
+  langgraph_pgadmin_data:
+    driver: local
+
+networks:
+  langgraph_network:
+    driver: bridge

@@ -1,0 +1,19 @@
+# LangGraph Memory Filter Dependencies
+# Install with: pip install -r requirements-langgraph.txt
+
+# Core LangGraph dependencies
+# IMPORTANT: langgraph 1.0+ required for langchain-core 0.3+ compatibility
+# Version 0.2.45 is incompatible with modern langchain (RunnableSerializable error)
+langgraph>=1.0.0
+langgraph-checkpoint-postgres
+
+# PostgreSQL driver with binary backend
+# psycopg[binary] includes the pre-compiled binary backend driver
+# This avoids needing PostgreSQL development libraries for compilation
+psycopg[binary]>=3.1.0
+
+# Connection pooling - required by the filter
+psycopg-pool>=3.1.0
+
+# Quick install command:
+# pip install "langgraph>=1.0.0" langgraph-checkpoint-postgres "psycopg[binary]" psycopg-pool
