@@ -6,7 +6,7 @@ version: 2.1.0
 license: MIT
 description: LLM-powered semantic memory merge with PostgreSQL persistence
 required_open_webui_version: >= 0.5.0
-requirements: psycopg[binary,pool]>=3.1.0, langgraph-checkpoint-postgres>=1.0.0, langgraph>=0.2.0
+requirements: langgraph>=1.0.0, langgraph-checkpoint-postgres, psycopg[binary], psycopg-pool
 """
 
 from __future__ import annotations
@@ -734,8 +734,31 @@ Return the COMPLETE MERGED fact list as JSON. Update existing facts if changed, 
                 self._log("Merge model returned empty - keeping existing facts", "warning")
             
             # =====================================================================
-            # STEP 2: Store merged result for graph node to process
+            # STEP 2: Check if facts actually changed before invoking graph
             # =====================================================================
+            new_facts = merged_data.get("facts", []) if merged_data else []
+            
+            # Compare facts - skip graph invoke if no changes
+            def facts_equal(old_facts: List[Dict], new_facts: List[Dict]) -> bool:
+                """Compare fact lists - returns True if semantically equal"""
+                if len(old_facts) != len(new_facts):
+                    return False
+                # Sort by (type, subject, value) for comparison
+                def fact_key(f):
+                    return (f.get("type", ""), f.get("subject", ""), f.get("value", ""))
+                old_sorted = sorted(old_facts, key=fact_key)
+                new_sorted = sorted(new_facts, key=fact_key)
+                for old, new in zip(old_sorted, new_sorted):
+                    if fact_key(old) != fact_key(new):
+                        return False
+                return True
+            
+            if facts_equal(existing_facts, new_facts):
+                self._log(f"No changes to facts ({len(existing_facts)} facts unchanged) - skipping graph invoke", "info")
+                return  # Skip checkpoint creation when nothing changed
+            
+            self._log(f"Facts changed: {len(existing_facts)} → {len(new_facts)} - invoking graph", "info")
+            
             self._extraction_result = merged_data
             
             # Set messages in state (for tracking, cleared after extraction node)
@@ -744,7 +767,7 @@ Return the COMPLETE MERGED fact list as JSON. Update existing facts if changed, 
             # =====================================================================
             # STEP 3: Invoke graph to store merged facts and update summary
             # =====================================================================
-            self._log("Step 2: Invoking memory graph workflow...", "info")
+            self._log("Step 3: Invoking memory graph workflow...", "info")
             loop = asyncio.get_event_loop()
             result = await asyncio.wait_for(
                 loop.run_in_executor(
@@ -966,10 +989,13 @@ I'll use this context to personalize my responses."""
                         }
                     })
                 
-                # Get recent messages for context
+                # Get recent USER messages only for extraction
+                # CRITICAL: Do NOT include system messages - they contain speaker personas
+                # that the extraction model might incorrectly interpret as user facts
                 recent_messages = [
                     {"role": msg.get("role"), "content": msg.get("content")}
                     for msg in messages[-10:]
+                    if msg.get("role") == "user"
                 ]
                 
                 # Update memory - await it to catch errors (extraction is important!)
