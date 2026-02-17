@@ -106,10 +106,7 @@ docker-compose -f docker-compose.langgraph.yml logs -f langgraph-postgres
    - Look for `langgraph-postgres` and `langgraph-pgadmin`
    - Both should show status: **running** with green indicator
 
-**Note:** The `init-postgres.sql` file is NOT mounted in docker-compose because:
-1. LangGraph creates its required tables automatically
-2. Mounting files can cause issues in Portainer and other Docker management tools
-3. Analytics tables can be added manually later if needed (see step 6)
+**Note:** LangGraph creates all required checkpoint and schema tables automatically on first run — no manual SQL setup is needed.
 
 **Services:**
 - PostgreSQL: `localhost:5432`
@@ -190,24 +187,6 @@ docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c "\dt
 docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory \
   -c "SELECT * FROM schema_migrations ORDER BY version;"
 ```
-
-### 6. (Optional) Install Analytics Tables
-
-The `init-postgres.sql` file contains helpful analytics tables but is **NOT required** for the filter to work. LangGraph creates its own tables automatically.
-
-If you want the analytics tables (user_memory_metadata, conversation_metadata, etc.):
-
-```bash
-cd /path/to/filters/memory_langgraph/docker
-
-# Install tables (note: use -i, not -it, when piping SQL files)
-docker exec -i langgraph-postgres psql -U langgraph -d langgraph_memory < init-postgres.sql
-
-# Verify
-docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c "\dt"
-```
-
-**Note:** The `-i` flag (not `-it`) is required when using input redirection (`<`). The `-t` (TTY) flag conflicts with stdin redirection.
 
 ---
 

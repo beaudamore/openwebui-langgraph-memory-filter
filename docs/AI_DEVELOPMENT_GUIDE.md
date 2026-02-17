@@ -26,8 +26,7 @@ filters/memory_langgraph/
 │   ├── LANGGRAPH_SETUP.md           # Human setup/installation guide
 │   └── EXTRACTION_MODEL_SETUP.md    # Extraction model configuration
 ├── docker/
-│   ├── docker-compose.langgraph.yml # PostgreSQL + PgAdmin stack
-│   └── init-postgres.sql            # Optional analytics tables
+│   └── docker-compose.langgraph.yml # PostgreSQL + PgAdmin stack
 └── prompt/
     └── EXTRACTION_PROMPT.md         # Reference extraction prompts
 ```

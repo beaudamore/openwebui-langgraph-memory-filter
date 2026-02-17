@@ -8,9 +8,6 @@ ENV POSTGRES_DB=langgraph_memory \
     POSTGRES_USER=langgraph \
     POSTGRES_PASSWORD=langgraph_password_change_me
 
-# Copy initialization script
-COPY init-postgres.sql /docker-entrypoint-initdb.d/
-
 # Install additional tools for debugging (optional)
 RUN apk add --no-cache postgresql-contrib
 
@@ -22,4 +19,4 @@ HEALTHCHECK --interval=10s --timeout=5s --retries=5 \
 EXPOSE 5432
 
 # Use default postgres entrypoint
-# Tables will be created automatically from init-postgres.sql on first run
+# Tables are created automatically by the filter on first run via PostgresSaver.setup()
