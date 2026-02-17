@@ -26,8 +26,7 @@ memory_langgraph/
 │   ├── langgraph_memory_filter.py    # Main filter code
 │   └── requirements-langgraph.txt    # Python dependencies
 ├── docker/
-│   ├── docker-compose.langgraph.yml  # PostgreSQL container
-│   └── init-postgres.sql             # Optional analytics tables
+│   └── docker-compose.langgraph.yml  # PostgreSQL container
 ├── docs/
 │   ├── LANGGRAPH_SETUP.md            # Full installation guide
 │   ├── EXTRACTION_MODEL_SETUP.md     # Extraction model configuration
@@ -109,12 +108,6 @@ docker-compose -f docker-compose.langgraph.yml up -d
 - Database: `langgraph_memory`
 - User: `langgraph`
 - Password: `langgraph_password_change_me`
-
-### Optional: Analytics Tables
-
-```bash
-docker exec -i langgraph-postgres psql -U langgraph -d langgraph_memory < init-postgres.sql
-```
 
 ## ⚙️ Configuration
 
