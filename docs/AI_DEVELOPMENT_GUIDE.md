@@ -54,10 +54,13 @@ User Message → Inlet Filter → Memory State Retrieval → Context Injection
 | `MemoryGraphState` | TypedDict defining all stored data | Lines ~60-130 |
 | `SCHEMA_VERSION` | Current schema version number | Line ~42 |
 | `SCHEMA_MIGRATIONS` | Migration history with field changes | Lines ~44-60 |
-| `Filter.inlet()` | Entry point - processes incoming messages | Lines ~950-1100 |
-| `_extract_information_node()` | LLM-based extraction | Lines ~340-430 |
-| `_deduplicate_memories_node()` | Handles duplicates/evolution | Lines ~460-510 |
-| `_format_memory_context()` | Formats memories for injection | Lines ~560-640 |
+| `PII_PATTERNS` | Compiled regex patterns for PII detection | PII section |
+| `detect_pii()` | Scan text for PII matches | PII section |
+| `scrub_pii()` | Replace PII in text with [REDACTED] | PII section |
+| `filter_facts_pii()` | Validate/filter extracted facts for PII | PII section |
+| `Filter.inlet()` | Entry point - processes incoming messages | ~Lines 1150+ |
+| `_update_user_memory_state()` | LLM merge + PII scrub + graph invoke | ~Lines 950+ |
+| `_format_memory_context()` | Formats memories for injection | ~Lines 1060+ |
 
 ---
 
@@ -138,7 +141,86 @@ timestamp = pref["mentioned_at"]  # KeyError on old data!
 
 ---
 
-## 📊 Data Structures (TypedDicts)
+## � PII Protection System
+
+The filter includes a 3-layer PII protection system. Understanding this is critical before modifying extraction or storage logic.
+
+### Architecture
+
+```
+User Message
+    │
+    ▼
+[Layer 2: Regex Pre-Scrub] ─── scrub_pii() replaces PII with [REDACTED]
+    │                          before messages reach the extraction LLM
+    ▼
+[Layer 1: Prompt Guardrails] ── Extraction prompt tells LLM to never extract PII
+    │
+    ▼
+[Layer 3: Post-Validation] ─── filter_facts_pii() scans extracted facts and
+    │                          drops/redacts any with PII patterns or blocked subjects
+    ▼
+Clean facts stored in PostgreSQL
+```
+
+### Key Functions
+
+| Function | Purpose |
+|----------|---------|
+| `detect_pii(text)` | Scan text, return list of PII matches with type/label/match |
+| `scrub_pii(text)` | Replace PII in text with `[REDACTED]` |
+| `validate_fact_no_pii(fact)` | Check one fact for PII; returns `{clean, blocked_reasons, scrubbed_fact}` |
+| `filter_facts_pii(facts, mode)` | Filter list of facts; mode `"remove"` or `"redact"` |
+
+### PII Pattern List
+
+Defined in `PII_PATTERNS` (top of file). Each entry has:
+- `name`: Short ID (e.g., `"ssn"`, `"phone"`)
+- `label`: Human-readable label
+- `pattern`: Compiled regex
+- `validator` (optional): Lambda for additional validation (e.g., SSN can't start with 000)
+
+Current patterns: `ssn`, `credit_card`, `phone`, `email`, `street_address`, `passport`, `drivers_license`, `bank_account`, `dob`, `ip_address`
+
+### Adding a New PII Pattern
+
+```python
+# Add to PII_PATTERNS list:
+{
+    "name": "vehicle_vin",
+    "label": "Vehicle VIN",
+    "pattern": re.compile(r'\b[A-HJ-NPR-Z0-9]{17}\b'),
+    # Optional validator:
+    "validator": lambda m: not m.group(0).isdigit(),  # VINs aren't all digits
+}
+```
+
+Then add `"vehicle_vin"` to the default list in `pii_patterns_enabled` valve.
+
+### Valve Configuration
+
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `pii_filter_enabled` | `True` | Master on/off for all PII filtering |
+| `pii_filter_mode` | `"remove"` | `"remove"` drops facts, `"redact"` keeps with `[REDACTED]` |
+| `pii_scrub_input` | `True` | Pre-scrub messages before extraction LLM |
+| `pii_patterns_enabled` | all 10 | List of pattern names to detect |
+
+### Subject Blocklist
+
+`PII_SUBJECT_BLOCKLIST` contains fact subjects that are always blocked regardless of regex:
+`ssn`, `social security`, `credit card`, `bank account`, `passport`, `drivers license`, `ip address`, etc.
+
+### When Modifying Extraction Logic
+
+- **Always** ensure PII pre-scrub runs before the merge prompt is built
+- **Always** ensure post-validation runs on `new_facts` before the `facts_equal()` comparison
+- If adding new fact types, check if they could contain PII and add to blocklist if needed
+- The extraction prompt in `prompt/EXTRACTION_PROMPT.md` contains a PII POLICY section — keep it in sync
+
+---
+
+## �📊 Data Structures (TypedDicts)
 
 ### Preference (Schema v2)
 
@@ -332,9 +414,11 @@ When making changes to this filter, verify:
 - [ ] Migration entry added with all field changes documented
 - [ ] Backward compatibility fallbacks added
 - [ ] TypedDict updated with correct types
-- [ ] `_deduplicate_memories_node()` updated if new entity type added
 - [ ] `_format_memory_context()` updated to display new data
 - [ ] `_create_summary_node()` updated for memory summary
+- [ ] PII implications reviewed (new fact types checked for PII risk)
+- [ ] PII patterns updated if new sensitive data types introduced
+- [ ] Extraction prompt PII POLICY section updated if needed
 - [ ] Test data cleared and fresh test performed
 - [ ] Docs updated (this file, LANGGRAPH_SETUP.md if needed)
 
@@ -356,6 +440,8 @@ For AI assistants looking to extend this system:
 
 6. **Entity Resolution** - "Sarah", "my wife Sarah", "she" → same entity.
 
+7. **Enhanced PII Detection** - Consider integrating Microsoft Presidio or spaCy NER for ML-based PII detection alongside regex patterns.
+
 ---
 
 ## 📚 Related Documentation
@@ -373,7 +459,10 @@ For AI assistants looking to extend this system:
 |------|--------|---------|
 | 2026-01-09 | v1 | Initial schema with first_mentioned/last_updated |
 | 2026-01-09 | v2 | Preference evolution tracking - keep all data points, added mentioned_at and context fields |
+| 2026-01-10 | v3 | Simplified to flexible fact-based schema |
+| 2026-01-10 | v4 | LLM-powered semantic merge replaces code-based deduplication |
+| 2026-02-17 | v4+ | 3-layer PII protection (prompt guardrails, regex pre-scrub, post-extraction validation) |
 
 ---
 
-*Last updated: 2026-01-09 by AI Assistant (Claude)*
+*Last updated: 2026-02-17 by AI Assistant (Claude)*

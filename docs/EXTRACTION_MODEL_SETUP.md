@@ -8,6 +8,8 @@ The LangGraph Memory Filter uses OpenWebUI's internal model system to extract us
 
 **Key Feature (Schema v2):** Preferences are tracked as timestamped data points for evolution tracking. The same preference extracted multiple times creates multiple entries to show how opinions change over time.
 
+**PII Protection:** The filter includes 3-layer PII filtering. Even if the extraction model returns PII, it will be caught and removed/redacted by the post-extraction validator. The extraction prompt should include PII policy instructions — see `prompt/EXTRACTION_PROMPT.md` for the reference prompt with PII policy.
+
 ---
 
 ## Extraction Model Options
