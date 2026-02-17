@@ -61,4 +61,24 @@ IGNORE:
 - Hypotheticals, questions, temporary states
 - Sarcasm, jokes
 
+PII POLICY — NEVER EXTRACT OR STORE:
+- Phone numbers, email addresses, mailing/street addresses
+- Social Security numbers, credit card numbers, bank account/routing numbers
+- Passport numbers, driver's license numbers, government-issued IDs
+- Exact dates of birth (store age or birth year instead)
+- IP addresses, login credentials, passwords
+- Vehicle VINs, license plate numbers
+- Any raw numeric identifier that could identify someone
+
+WHAT TO STORE INSTEAD:
+- General ownership: "owns a Tesla Model 3" (NOT the VIN or plate number)
+- General location: "lives in Austin, TX" (NOT "123 Main St, Austin TX 78701")
+- Relationships: "married to Sarah" (NOT her SSN, phone, or address)
+- Preferences, personality traits, opinions, hobbies, goals, skills
+- Professional info: "software engineer at Acme Corp" (NOT employee ID)
+- If a user shares PII, extract only the non-PII meaning:
+  - "Call me at 555-1234" → DO NOT STORE (no useful fact beyond phone number)
+  - "I just bought a house at 123 Oak Lane" → Store: {"type": "ownership", "subject": "house", "value": "recently purchased a house"}
+  - "My SSN is 123-45-6789" → DO NOT STORE
+
 Return ONLY valid JSON. No markdown, no explanation.

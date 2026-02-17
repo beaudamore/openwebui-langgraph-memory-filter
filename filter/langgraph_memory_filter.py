@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, TypedDict
 from urllib.parse import quote_plus
@@ -119,6 +120,268 @@ class MemoryGraphState(TypedDict):
     memory_summary: str
 
 
+# ============================================================================
+# PII Detection & Scrubbing
+# ============================================================================
+
+# Compiled regex patterns for PII detection - ordered by specificity
+PII_PATTERNS: List[Dict[str, Any]] = [
+    # Social Security Numbers (XXX-XX-XXXX, XXXXXXXXX, XXX XX XXXX)
+    {
+        "name": "ssn",
+        "label": "Social Security Number",
+        "pattern": re.compile(
+            r'\b(\d{3}[-\s]?\d{2}[-\s]?\d{4})\b'
+        ),
+        "validator": lambda m: not m.group(1).replace("-", "").replace(" ", "").startswith("000"),
+    },
+    # Credit Card Numbers (major brands, with or without separators)
+    {
+        "name": "credit_card",
+        "label": "Credit Card Number",
+        "pattern": re.compile(
+            r'\b([3-6]\d{3}[-\s]?\d{4}[-\s]?\d{4}[-\s]?\d{3,4})\b'
+        ),
+    },
+    # US Phone Numbers (various formats)
+    {
+        "name": "phone",
+        "label": "Phone Number",
+        "pattern": re.compile(
+            r'(?<!\d)'                         # not preceded by digit
+            r'(?:\+?1[-.\s]?)?'                # optional country code
+            r'(?:\(?\d{3}\)?[-.\s]?)'          # area code
+            r'(?:\d{3}[-.\s]?\d{4})'           # subscriber number
+            r'(?!\d)',                          # not followed by digit
+        ),
+    },
+    # Email Addresses
+    {
+        "name": "email",
+        "label": "Email Address",
+        "pattern": re.compile(
+            r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'
+        ),
+    },
+    # US Street Addresses (number + street name + suffix)
+    {
+        "name": "street_address",
+        "label": "Street Address",
+        "pattern": re.compile(
+            r'\b\d{1,6}\s+'                                         # house number
+            r'(?:[NSEW]\.?\s+)?'                                    # optional direction
+            r'[A-Z][a-zA-Z\s]{1,30}\s+'                             # street name
+            r'(?:Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr'
+            r'|Lane|Ln|Road|Rd|Court|Ct|Circle|Cir|Way|Place|Pl'
+            r'|Terrace|Ter|Trail|Trl|Parkway|Pkwy|Highway|Hwy)'
+            r'\.?'
+            r'(?:\s*(?:#|Apt|Suite|Ste|Unit|Fl|Floor)\s*\w+)?',     # optional unit
+            re.IGNORECASE,
+        ),
+    },
+    # Passport Numbers (US format: 1 letter + 8 digits, or 9 digits)
+    {
+        "name": "passport",
+        "label": "Passport Number",
+        "pattern": re.compile(
+            r'\b(?:passport\s*(?:#|number|num|no)?:?\s*)([A-Z]\d{8}|\d{9})\b',
+            re.IGNORECASE,
+        ),
+    },
+    # Driver's License (state-pattern agnostic: mentioned + alphanumeric ID)
+    {
+        "name": "drivers_license",
+        "label": "Driver's License Number",
+        "pattern": re.compile(
+            r"(?:driver'?s?\s*license\s*(?:#|number|num|no)?:?\s*)([A-Z0-9]{5,15})",
+            re.IGNORECASE,
+        ),
+    },
+    # Bank Account / Routing Numbers (when labelled)
+    {
+        "name": "bank_account",
+        "label": "Bank Account Number",
+        "pattern": re.compile(
+            r'(?:account|routing|acct)\s*(?:#|number|num|no)?:?\s*(\d{6,17})',
+            re.IGNORECASE,
+        ),
+    },
+    # Date of Birth (when labelled — we allow general dates in context)
+    {
+        "name": "dob",
+        "label": "Date of Birth",
+        "pattern": re.compile(
+            r'(?:(?:date\s*of\s*birth|dob|born\s*on|birthday\s*is)\s*:?\s*)'
+            r'(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4})',
+            re.IGNORECASE,
+        ),
+    },
+    # IP Addresses (v4)
+    {
+        "name": "ip_address",
+        "label": "IP Address",
+        "pattern": re.compile(
+            r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b'
+        ),
+        "validator": lambda m: all(0 <= int(x) <= 255 for x in m.group(1).split(".")),
+    },
+]
+
+# Fact-type allowlist: these types are safe to store (no PII scrub needed at type level)
+# The PII scrub happens on the *values*, not types — this is just for docs/reference
+SAFE_FACT_TYPES = {
+    "preference", "ownership", "relationship", "goal", "skill", "event",
+    "personality", "interest", "hobby", "trait", "opinion",
+}
+
+# Fact subjects that should ALWAYS be blocked even if the regex doesn't fire
+PII_SUBJECT_BLOCKLIST = {
+    "ssn", "social security", "social security number",
+    "credit card", "credit card number", "card number",
+    "bank account", "routing number", "account number",
+    "passport", "passport number",
+    "drivers license", "driver's license", "license number",
+    "ip address",
+}
+
+
+def detect_pii(text: str, patterns: Optional[List[str]] = None) -> List[Dict[str, str]]:
+    """
+    Detect PII in text. Returns list of matches with type and matched value.
+    
+    Args:
+        text: Text to scan
+        patterns: Optional list of pattern names to check (None = all)
+    
+    Returns:
+        List of {"type": "ssn", "label": "Social Security Number", "match": "123-45-6789"}
+    """
+    if not text:
+        return []
+    
+    findings = []
+    for pii in PII_PATTERNS:
+        if patterns and pii["name"] not in patterns:
+            continue
+        for match in pii["pattern"].finditer(text):
+            # Run optional validator (e.g., SSN can't start with 000)
+            validator = pii.get("validator")
+            if validator and not validator(match):
+                continue
+            findings.append({
+                "type": pii["name"],
+                "label": pii["label"],
+                "match": match.group(0),
+            })
+    return findings
+
+
+def scrub_pii(text: str, replacement: str = "[REDACTED]", patterns: Optional[List[str]] = None) -> str:
+    """
+    Replace all PII matches in text with a redaction placeholder.
+    
+    Args:
+        text: Text to scrub
+        replacement: What to replace PII with (default: [REDACTED])
+        patterns: Optional list of pattern names to scrub (None = all)
+    
+    Returns:
+        Scrubbed text
+    """
+    if not text:
+        return text
+    
+    for pii in PII_PATTERNS:
+        if patterns and pii["name"] not in patterns:
+            continue
+        
+        def _replace(match):
+            validator = pii.get("validator")
+            if validator and not validator(match):
+                return match.group(0)  # keep non-matching
+            return replacement
+        
+        text = pii["pattern"].sub(_replace, text)
+    
+    return text
+
+
+def validate_fact_no_pii(fact: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Validate a single extracted fact for PII. Returns a dict with:
+      - "clean": bool — True if the fact is safe to store
+      - "blocked_reasons": list of reasons if not clean
+      - "scrubbed_fact": the fact with PII redacted (if partially salvageable)
+    """
+    reasons = []
+    
+    # Check subject against blocklist
+    subject_lower = fact.get("subject", "").lower().strip()
+    if subject_lower in PII_SUBJECT_BLOCKLIST:
+        reasons.append(f"Blocked subject: '{fact.get('subject')}'")
+    
+    # Check value for PII patterns
+    value = fact.get("value", "")
+    pii_found = detect_pii(value)
+    if pii_found:
+        for p in pii_found:
+            reasons.append(f"{p['label']} detected in value: '{p['match']}'")
+    
+    # Check subject field for PII patterns too
+    subject = fact.get("subject", "")
+    subject_pii = detect_pii(subject)
+    if subject_pii:
+        for p in subject_pii:
+            reasons.append(f"{p['label']} detected in subject: '{p['match']}'")
+    
+    if reasons:
+        return {
+            "clean": False,
+            "blocked_reasons": reasons,
+            "scrubbed_fact": {
+                **fact,
+                "value": scrub_pii(value),
+                "subject": scrub_pii(subject),
+            }
+        }
+    
+    return {"clean": True, "blocked_reasons": [], "scrubbed_fact": fact}
+
+
+def filter_facts_pii(
+    facts: List[Dict[str, Any]],
+    mode: str = "remove",
+    logger_fn: Optional[Callable] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Filter a list of extracted facts, removing or scrubbing PII.
+    
+    Args:
+        facts: List of fact dicts from extraction
+        mode: "remove" = drop facts with PII entirely
+              "redact" = keep fact but replace PII with [REDACTED]
+        logger_fn: Optional logging function
+    
+    Returns:
+        Cleaned list of facts
+    """
+    cleaned = []
+    for fact in facts:
+        result = validate_fact_no_pii(fact)
+        if result["clean"]:
+            cleaned.append(fact)
+        else:
+            if logger_fn:
+                logger_fn(
+                    f"PII blocked in fact ({fact.get('type')}/{fact.get('subject')}): "
+                    f"{', '.join(result['blocked_reasons'])}"
+                )
+            if mode == "redact":
+                cleaned.append(result["scrubbed_fact"])
+            # else "remove" → skip entirely
+    return cleaned
+
+
 class MemoryExtraction(BaseModel):
     """Merged memory facts from LLM - replaces all existing facts"""
     facts: List[Dict[str, Any]] = Field(default_factory=list)
@@ -200,6 +463,24 @@ class Filter:
             description="Show which memories were injected (debug mode)"
         )
         
+        # PII Protection
+        pii_filter_enabled: bool = Field(
+            default=True,
+            description="Enable PII detection and filtering. When enabled, phone numbers, SSNs, addresses, credit cards, and other PII are blocked from memory storage."
+        )
+        pii_filter_mode: Literal["remove", "redact"] = Field(
+            default="remove",
+            description="How to handle facts containing PII. 'remove' = drop the entire fact, 'redact' = store the fact with PII replaced by [REDACTED]"
+        )
+        pii_scrub_input: bool = Field(
+            default=True,
+            description="Scrub PII from messages BEFORE sending to extraction model. Prevents PII from even reaching the LLM."
+        )
+        pii_patterns_enabled: List[str] = Field(
+            default=["ssn", "credit_card", "phone", "email", "street_address", "passport", "drivers_license", "bank_account", "dob", "ip_address"],
+            description="Which PII pattern types to detect. Remove items to allow them through. Options: ssn, credit_card, phone, email, street_address, passport, drivers_license, bank_account, dob, ip_address"
+        )
+
         # Debug
         debug_mode: bool = Field(
             default=False,
@@ -692,14 +973,39 @@ class Filter:
             # Format existing facts for prompt
             existing_facts_json = json.dumps(existing_facts, indent=2) if existing_facts else "[]"
             
+            # =====================================================================
+            # PII PRE-SCRUB: Redact PII from messages before sending to LLM
+            # This prevents the extraction model from ever seeing raw PII
+            # =====================================================================
+            messages_for_extraction = new_messages
+            if self.valves.pii_filter_enabled and self.valves.pii_scrub_input:
+                self._log("PII pre-scrub: scanning messages before extraction...", "info")
+                messages_for_extraction = []
+                for msg in new_messages:
+                    scrubbed_content = scrub_pii(
+                        msg.get("content", ""),
+                        replacement="[REDACTED]",
+                        patterns=self.valves.pii_patterns_enabled,
+                    )
+                    if scrubbed_content != msg.get("content", ""):
+                        self._log("PII pre-scrub: redacted PII in message", "info")
+                    messages_for_extraction.append({**msg, "content": scrubbed_content})
+
             # Build merge prompt - LLM returns complete merged fact list
             merge_prompt = f"""EXISTING FACTS:
 {existing_facts_json}
 
 NEW CONVERSATION:
-{json.dumps(new_messages, indent=2)}
+{json.dumps(messages_for_extraction, indent=2)}
 
 Return the COMPLETE MERGED fact list as JSON. Update existing facts if changed, remove if contradicted, add new ones.
+
+PII POLICY: NEVER extract or store personally identifiable information including:
+- Phone numbers, email addresses, street addresses
+- Social Security numbers, credit card numbers, bank accounts
+- Passport numbers, driver's license numbers, dates of birth
+- IP addresses or any government-issued ID numbers
+DO store: personality traits, preferences, ownership types (e.g. "owns a Tesla" but NOT the VIN), relationships (e.g. "married to Sarah" but NOT her SSN), goals, skills, interests.
 
 {{"facts": [...]}}"""
 
@@ -738,6 +1044,23 @@ Return the COMPLETE MERGED fact list as JSON. Update existing facts if changed, 
             # =====================================================================
             new_facts = merged_data.get("facts", []) if merged_data else []
             
+            # =====================================================================
+            # PII POST-VALIDATION: Scan extracted facts and remove/redact PII
+            # Defense-in-depth — catches anything the LLM still included
+            # =====================================================================
+            if self.valves.pii_filter_enabled and new_facts:
+                pre_count = len(new_facts)
+                new_facts = filter_facts_pii(
+                    new_facts,
+                    mode=self.valves.pii_filter_mode,
+                    logger_fn=lambda msg: self._log(f"PII filter: {msg}", "warning"),
+                )
+                blocked_count = pre_count - len(new_facts)
+                if blocked_count > 0:
+                    self._log(f"PII post-validation: blocked {blocked_count} fact(s) containing PII", "warning")
+                else:
+                    self._log("PII post-validation: all facts clean", "debug")
+
             # Compare facts - skip graph invoke if no changes
             def facts_equal(old_facts: List[Dict], new_facts: List[Dict]) -> bool:
                 """Compare fact lists - returns True if semantically equal"""

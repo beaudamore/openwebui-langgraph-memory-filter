@@ -13,7 +13,7 @@ Enterprise-grade graph-based memory system using LangGraph with PostgreSQL for:
 - **Scalability** - Handle millions of users with PostgreSQL
 
 ### Current Versions
-- **Filter Schema:** v2 (see `SCHEMA_VERSION` in filter)
+- **Filter Schema:** v4 (see `SCHEMA_VERSION` in filter)
 - **LangGraph:** 1.0.5 (upgraded from 0.2.45)
 - **PostgreSQL:** 16-alpine
 
@@ -27,8 +27,7 @@ Enterprise-grade graph-based memory system using LangGraph with PostgreSQL for:
 │                                                               │
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │  LangGraph Memory Filter (Python)                     │  │
-│  │  • Extracts user info from conversations              │  │
-│  │  • Manages graph state (relationships, prefs, etc.)   │  │
+│  │  • Extracts user info from conversations              │  ││  │  • 3-layer PII filtering (pre-scrub, prompt, post-val) │  ││  │  • Manages graph state (relationships, prefs, etc.)   │  │
 │  │  • Injects memories into model context                │  │
 │  └───────────────────┬───────────────────────────────────┘  │
 │                      │                                        │
@@ -207,6 +206,8 @@ docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory \
 |---------|------|-------------|
 | 1 | 2026-01-09 | Initial schema with first_mentioned/last_updated fields |
 | 2 | 2026-01-09 | Preference evolution tracking - keep all data points |
+| 3 | 2026-01-10 | Simplified to flexible fact-based schema |
+| 4 | 2026-01-10 | LLM-powered semantic merge replaces code-based deduplication |
 
 ### How It Works
 
@@ -252,6 +253,15 @@ See [AI_DEVELOPMENT_GUIDE.md](AI_DEVELOPMENT_GUIDE.md) for detailed instructions
 | `enable_memory_injection` | `true` | Inject memories into model context |
 | `max_injected_memories` | `10` | Max facts to inject |
 | `memory_injection_format` | `structured` | Format: structured/natural/bullet |
+
+### PII Protection Valves
+
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `pii_filter_enabled` | `true` | Enable 3-layer PII detection and filtering |
+| `pii_filter_mode` | `"remove"` | `"remove"` drops facts with PII; `"redact"` stores with `[REDACTED]` |
+| `pii_scrub_input` | `true` | Scrub PII from messages before sending to extraction model |
+| `pii_patterns_enabled` | all 10 | Which PII types to detect: ssn, credit_card, phone, email, street_address, passport, drivers_license, bank_account, dob, ip_address |
 
 ---
 
@@ -437,6 +447,12 @@ SELECT count(*) FROM pg_stat_activity WHERE datname = 'langgraph_memory';
 5. **User isolation:**
    - Filter automatically isolates memories by user_id
    - PostgreSQL row-level security (optional)
+
+6. **PII Protection (enabled by default):**
+   - 3-layer defense: prompt guardrails + regex pre-scrub + post-extraction validation
+   - Detects SSN, credit cards, phone numbers, email, street addresses, passport, driver's license, bank accounts, DOB, IP addresses
+   - Stores personality traits, preferences, ownership types — never raw PII
+   - Configure via `pii_filter_enabled`, `pii_filter_mode`, `pii_scrub_input`, `pii_patterns_enabled` valves
 
 ---
 
