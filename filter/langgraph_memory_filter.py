@@ -807,6 +807,17 @@ class Filter:
         
         return state
 
+    def _clean_model_response(self, text: str) -> str:
+        """Strip <think> tags and other noise from model response"""
+        if not text:
+            return ""
+        
+        # Remove <think> blocks (thinking models like DeepSeek-R1, QwQ, etc)
+        # re.DOTALL matches newlines, re.IGNORECASE for case insensitivity
+        cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        
+        return cleaned.strip()
+
     async def _call_extraction_model(
         self, 
         prompt: str, 
@@ -870,7 +881,7 @@ class Filter:
                     return None
                 
                 self._log(f"Extraction model response length: {len(response_text)} chars", "debug")
-                return response_text
+                return self._clean_model_response(response_text)
             else:
                 self._log(f"Unexpected response type from extraction model: {type(response)}. Response: {response}", "error")
                 return None
@@ -1177,8 +1188,10 @@ CURRENT CONVERSATION:
                 self._log("Relevance model returned empty — falling back to all facts", "warning")
                 return facts
 
-            # Clean JSON
-            cleaned = response_text.strip()
+            # Clean JSON (remove thinking tags first)
+            cleaned = self._clean_model_response(response_text)
+            
+            # Remove markdown code blocks
             if cleaned.startswith("```"):
                 lines = cleaned.split("\n")
                 cleaned = "\n".join(lines[1:-1] if len(lines) > 2 else lines)
