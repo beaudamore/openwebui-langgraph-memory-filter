@@ -426,11 +426,7 @@ class Filter:
         # LLM Configuration for Extraction
         extraction_model_id: str = Field(
             default="memory-manager",
-            description="OpenWebUI Model ID for memory extraction. Model must use included prompt."
-        )
-        extraction_model_temperature: float = Field(
-            default=0.1,
-            description="Temperature for extraction model (lower = more consistent JSON)"
+            description="OpenWebUI Model ID for memory extraction. Create a model with EXTRACTION_PROMPT.md as system prompt."
         )
         extraction_model_max_tokens: int = Field(
             default=1000,
@@ -479,6 +475,24 @@ class Filter:
         pii_patterns_enabled: List[str] = Field(
             default=["ssn", "credit_card", "phone", "email", "street_address", "passport", "drivers_license", "bank_account", "dob", "ip_address"],
             description="Which PII pattern types to detect. Remove items to allow them through. Options: ssn, credit_card, phone, email, street_address, passport, drivers_license, bank_account, dob, ip_address"
+        )
+
+        # Relevance Filtering
+        relevance_filter_enabled: bool = Field(
+            default=True,
+            description="When enabled, only memories relevant to the current conversation are injected instead of all stored facts. Requires a separate relevance model."
+        )
+        relevance_model_id: str = Field(
+            default="memory-relevance",
+            description="OpenWebUI Model ID for relevance filtering. Create a model with RELEVANCE_PROMPT.md as system prompt."
+        )
+        relevance_model_max_tokens: int = Field(
+            default=1000,
+            description="Max tokens for relevance model response"
+        )
+        always_inject_types: List[str] = Field(
+            default=["identity"],
+            description="Fact types that ALWAYS get injected regardless of relevance filtering. Identity facts (name, job, location) are usually always useful."
         )
 
         # Debug
@@ -825,11 +839,10 @@ class Filter:
                 "model": self.valves.extraction_model_id,
                 "messages": [{"role": "user", "content": prompt}],
                 "stream": False,
-                "temperature": self.valves.extraction_model_temperature,
                 "max_tokens": self.valves.extraction_model_max_tokens,
             }
             
-            self._log(f"Extraction payload: model={payload['model']}, temp={payload['temperature']}, prompt_len={len(prompt)}", "info")
+            self._log(f"Extraction payload: model={payload['model']}, prompt_len={len(prompt)}", "info")
             
             # Call OpenWebUI's internal API (bypasses filters to avoid recursion)
             self._log("Calling generate_chat_completion...", "info")
@@ -991,23 +1004,12 @@ class Filter:
                         self._log("PII pre-scrub: redacted PII in message", "info")
                     messages_for_extraction.append({**msg, "content": scrubbed_content})
 
-            # Build merge prompt - LLM returns complete merged fact list
+            # Build merge prompt - data only, model's system prompt handles instructions
             merge_prompt = f"""EXISTING FACTS:
 {existing_facts_json}
 
 NEW CONVERSATION:
-{json.dumps(messages_for_extraction, indent=2)}
-
-Return the COMPLETE MERGED fact list as JSON. Update existing facts if changed, remove if contradicted, add new ones.
-
-PII POLICY: NEVER extract or store personally identifiable information including:
-- Phone numbers, email addresses, street addresses
-- Social Security numbers, credit card numbers, bank accounts
-- Passport numbers, driver's license numbers, dates of birth
-- IP addresses or any government-issued ID numbers
-DO store: personality traits, preferences, ownership types (e.g. "owns a Tesla" but NOT the VIN), relationships (e.g. "married to Sarah" but NOT her SSN), goals, skills, interests.
-
-{{"facts": [...]}}"""
+{json.dumps(messages_for_extraction, indent=2)}"""
 
             # Call extraction model (async - works properly here!)
             merged_json = await self._call_extraction_model(
@@ -1109,6 +1111,98 @@ DO store: personality traits, preferences, ownership types (e.g. "owns a Tesla" 
             self._log(f"Failed to update memory state: {type(e).__name__}: {e}", "error")
             import traceback
             self._log(f"State update traceback: {traceback.format_exc()}", "error")
+
+    async def _select_relevant_memories(
+        self,
+        facts: List[Dict[str, Any]],
+        messages: List[Dict[str, str]],
+        user: Optional[Dict[str, Any]] = None,
+        request: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Use LLM to select only facts relevant to the current conversation.
+        Identity-type facts (and other always_inject_types) bypass filtering.
+        """
+        if not facts:
+            return []
+
+        # Split into always-inject vs filterable
+        always_facts = [
+            f for f in facts if f.get("type", "other") in self.valves.always_inject_types
+        ]
+        filterable_facts = [
+            f for f in facts if f.get("type", "other") not in self.valves.always_inject_types
+        ]
+
+        if not filterable_facts:
+            self._log("All facts are always-inject types, skipping relevance filter", "debug")
+            return always_facts
+
+        # Build the conversation context (last few messages)
+        recent_conversation = [
+            {"role": m.get("role"), "content": m.get("content")}
+            for m in messages[-6:]
+            if m.get("role") in ("user", "assistant")
+        ]
+
+        relevance_prompt = f"""STORED FACTS:
+{json.dumps(filterable_facts, indent=2)}
+
+CURRENT CONVERSATION:
+{json.dumps(recent_conversation, indent=2)}"""
+
+        try:
+            # Call the relevance model
+            payload = {
+                "model": self.valves.relevance_model_id,
+                "messages": [{"role": "user", "content": relevance_prompt}],
+                "stream": False,
+                "max_tokens": self.valves.relevance_model_max_tokens,
+            }
+
+            response = await generate_chat_completion(
+                request=request,
+                form_data=payload,
+                user=user,
+                bypass_filter=True,
+            )
+
+            response_text = None
+            if isinstance(response, dict):
+                choices = response.get("choices", [])
+                if choices:
+                    response_text = choices[0].get("message", {}).get("content", "")
+
+            if not response_text:
+                self._log("Relevance model returned empty — falling back to all facts", "warning")
+                return facts
+
+            # Clean JSON
+            cleaned = response_text.strip()
+            if cleaned.startswith("```"):
+                lines = cleaned.split("\n")
+                cleaned = "\n".join(lines[1:-1] if len(lines) > 2 else lines)
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:].strip()
+
+            parsed = json.loads(cleaned)
+            relevant = parsed.get("relevant_facts", [])
+
+            self._log(
+                f"Relevance filter: {len(filterable_facts)} filterable → {len(relevant)} relevant "
+                f"(+ {len(always_facts)} always-inject)",
+                "info",
+            )
+
+            # Combine always-inject + relevance-filtered
+            return always_facts + relevant
+
+        except json.JSONDecodeError as e:
+            self._log(f"Relevance model returned invalid JSON: {e} — falling back to all facts", "warning")
+            return facts
+        except Exception as e:
+            self._log(f"Relevance filtering failed: {type(e).__name__}: {e} — falling back to all facts", "warning")
+            return facts
 
     def _format_memory_context(self, memory_state: Dict[str, Any]) -> str:
         """Format memory state for injection into model context"""
@@ -1253,7 +1347,38 @@ I'll use this context to personalize my responses."""
             
             # Always inject memories into context (that's the point of this filter)
             if memory_state:
-                memory_context = self._format_memory_context(memory_state)
+                all_facts = memory_state.get("facts", [])
+                injected_facts = all_facts
+
+                # --- Relevance filtering ---
+                if (
+                    self.valves.relevance_filter_enabled
+                    and all_facts
+                    and body.get("messages")
+                ):
+                    if self.valves.show_status and __event_emitter__:
+                        await __event_emitter__({
+                            "type": "status",
+                            "data": {
+                                "description": "🔎 Filtering relevant memories...",
+                                "done": False
+                            }
+                        })
+
+                    injected_facts = await self._select_relevant_memories(
+                        all_facts,
+                        body.get("messages", []),
+                        user=__user__,
+                        request=__request__,
+                    )
+                    self._log(
+                        f"Relevance filter: {len(all_facts)} total → {len(injected_facts)} relevant",
+                        "info",
+                    )
+
+                # Build a filtered memory state for formatting
+                filtered_state = {**memory_state, "facts": injected_facts, "total_facts": len(injected_facts)}
+                memory_context = self._format_memory_context(filtered_state)
                 
                 if memory_context:
                     # Inject into system message
@@ -1277,12 +1402,17 @@ I'll use this context to personalize my responses."""
                         body["messages"] = messages
                         
                         if self.valves.show_status and __event_emitter__:
-                            total_facts = memory_state.get('total_facts', 0)
-                            if total_facts > 0:
+                            total_stored = memory_state.get('total_facts', 0)
+                            injected_count = len(injected_facts)
+                            if injected_count > 0:
+                                if self.valves.relevance_filter_enabled and injected_count < total_stored:
+                                    desc = f"💭 Recalled {injected_count} of {total_stored} memories relevant to this chat"
+                                else:
+                                    desc = f"💭 Recalled {injected_count} memories about you"
                                 await __event_emitter__({
                                     "type": "status",
                                     "data": {
-                                        "description": f"💭 Recalled {total_facts} memories about you",
+                                        "description": desc,
                                         "done": True
                                     }
                                 })
