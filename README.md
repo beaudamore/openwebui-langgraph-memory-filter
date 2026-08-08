@@ -85,6 +85,7 @@ Quick version:
 | [LANGGRAPH_SETUP.md](docs/LANGGRAPH_SETUP.md) | Complete installation and setup guide |
 | [EXTRACTION_MODEL_SETUP.md](docs/EXTRACTION_MODEL_SETUP.md) | Extraction model configuration |
 | [AI_DEVELOPMENT_GUIDE.md](docs/AI_DEVELOPMENT_GUIDE.md) | Guide for AI assistants modifying this code |
+| [MEMORY_FILTER_V2_PLAN.md](docs/MEMORY_FILTER_V2_PLAN.md) | Planned conversation-memory and per-speaker summary architecture |
 | [DEPENDENCY_RESOLUTION.md](DEPENDENCY_RESOLUTION.md) | Dependency troubleshooting |
 
 ## 🔧 Requirements
