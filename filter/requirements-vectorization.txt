@@ -1,0 +1,2 @@
+# Additional dependencies for the optional pgvector/embedding feature.
+httpx>=0.27,<1
