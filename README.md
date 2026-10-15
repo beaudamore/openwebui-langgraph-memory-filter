@@ -57,8 +57,9 @@ docker-compose -f docker-compose.langgraph.yml up -d
 ```bash
 # In your Open WebUI container
 docker exec -it <open-webui-container> pip install \
-  "langgraph>=1.0.0" \
-  langgraph-checkpoint-postgres \
+  "langgraph~=0.6.11" \
+  "langgraph-sdk<0.4" \
+  "langgraph-checkpoint-postgres<3" \
   "psycopg[binary]" \
   psycopg-pool
 ```
@@ -95,8 +96,9 @@ Quick version:
 - **PostgreSQL**: 16+ (provided via Docker)
 - **Dependencies**:
   ```
-  langgraph>=1.0.0
-  langgraph-checkpoint-postgres
+  langgraph~=0.6.11          # not 1.x: see DEPENDENCY_RESOLUTION.md (websockets downgrade)
+  langgraph-sdk<0.4
+  langgraph-checkpoint-postgres<3
   psycopg[binary]
   psycopg-pool
   ```
@@ -219,8 +221,13 @@ This document contains critical information about:
 
 **`cannot import name 'RunnableSerializable'`**
 ```bash
-pip install "langgraph>=1.0.0"
+pip install "langgraph~=0.6.11"   # langgraph 0.2.x is too old for modern langchain-core
 ```
+
+**`cannot import name 'OP_BINARY' from 'websockets.frames'`** (first chat after a container start)
+Caused by langgraph 1.x: its langgraph-sdk 0.4.x pins `websockets<17`, so Open WebUI's startup pip run
+downgrades websockets under the already-running server. Keep the pins above (langgraph 0.6.x,
+langgraph-sdk <0.4), which leave websockets alone.
 
 **`ImportError: no pq wrapper available`**
 ```bash
@@ -231,6 +238,32 @@ pip install "psycopg[binary]"
 ```bash
 pip install psycopg-pool
 ```
+
+**`TypeError: expected string or bytes-like object, got 'list'`** in `_update_user_memory_state`, or
+**`request (N tokens) exceeds the available context size`** from the relevance model
+Happened when a chat message had an image attached: Open WebUI then sends `content` as a list of
+parts (text + base64 `image_url`) instead of a string, which broke the PII regex scrub and pushed the
+whole image into the relevance prompt. Fixed in the filter (2026-10-14): `content_to_text()` keeps only
+the text parts and drops image data. Each message is also capped by a character budget derived
+from the relevance/extraction model's context size, read from Open WebUI's model registry (llama.cpp
+reports `meta.n_ctx`; presets are followed to their base model). Half the context at 3 chars/token is
+split across the messages in the prompt. When no context size is reported, the `max_message_chars`
+valve (default 12000, 0 = off) is used instead.
+
+**Existing facts disappear after a chat** (e.g. 2 facts in, 2 facts out, but one old fact replaced)
+The extraction model is asked to return the merged fact list and a small model sometimes omits facts it
+was given. Since 2026-10-14 the filter upserts the model's output onto the stored facts (`merge_mode`
+valve, default `upsert`): same type+subject updates the fact and keeps `first_mentioned`, new
+type+subject is appended, and facts the model did not return are kept. A fact is dropped only when
+the model returns it with `"remove": true` or `"status": "removed"`. Set `merge_mode` to `replace`
+for the old trust-the-model behaviour. The memory-manager preset's system prompt must match this
+contract (it is tracked in [prompt/MERGE_PROMPT_memory-manager.md](prompt/MERGE_PROMPT_memory-manager.md)
+and installed in the `model` table): removals are explicit `"remove": true` entries, never omissions.
+
+**Forget commands.** Both "forget everything you know about me" and targeted forgets such as
+"forget my cars" go through the extraction model, which must return each matching fact (or every fact)
+with `"remove": true`. The log line `Merge upsert: ... removed` shows what it did. Memory extraction for that message
+was skipped, so re-send the fact in a new message.
 
 See [DEPENDENCY_RESOLUTION.md](DEPENDENCY_RESOLUTION.md) for detailed troubleshooting.
 

@@ -1,8 +1,37 @@
 # LangGraph Memory Filter - Dependency Resolution
 
-## ✅ SOLUTION FOUND - TESTED AND VERIFIED (Updated June 2025)
+## ✅ CURRENT PINS (Updated 2026-10-13, Open WebUI 0.12.0)
 
-After extensive testing in isolated virtual environment, the working dependency configuration is:
+```bash
+pip install "langgraph~=0.6.11" "langgraph-sdk<0.4" "langgraph-checkpoint-postgres<3" "psycopg[binary]" psycopg-pool
+```
+
+Frontmatter line (Open WebUI splits it on commas, so no commas inside a single spec):
+
+```
+requirements: langgraph~=0.6.11, langgraph-sdk<0.4, langgraph-checkpoint-postgres<3, psycopg[binary], psycopg-pool
+```
+
+### Why not langgraph 1.x any more
+
+- Every langgraph 1.x release requires `langgraph-sdk 0.4.x`, and every sdk 0.4.x pins `websockets<17`.
+- The Open WebUI 0.12.0 image ships `websockets 17.2` (used by uvicorn). Open WebUI installs all plugin
+  requirements with pip at container start, *after* uvicorn has already imported websockets 17.2, so pip
+  downgraded websockets to 16.1.1 on disk under the running process.
+- websockets 17 removed the `OP_BINARY` constant from `websockets.frames`. The first import of this filter
+  after the swap loaded 16.1.1 modules against the cached 17.2 `frames` module and failed with
+  `cannot import name 'OP_BINARY' from 'websockets.frames'`, which killed the first chat after every restart.
+- `langgraph-sdk` 0.2.x/0.3.x has no websockets dependency, and langgraph 0.6.11 imports cleanly against
+  langchain-core 1.4.8 (verified in a venv; `pip check` clean; websockets stays at 17.2). The filter only uses
+  `PostgresSaver`, `StateGraph` and `END`, all present in 0.6.
+- Open WebUI 0.12.0 resolves this set to: langgraph 0.6.11, langgraph-sdk 0.2.15, langgraph-checkpoint 2.1.2,
+  langgraph-checkpoint-postgres 2.0.25.
+
+Re-check these pins whenever the Open WebUI image bumps websockets or langgraph-sdk 0.4+ drops its websockets cap.
+
+## Previous solution (June 2025, superseded)
+
+After extensive testing in isolated virtual environment, the working dependency configuration was:
 
 ```bash
 pip install "langgraph>=1.0.0" langgraph-checkpoint-postgres "psycopg[binary]" psycopg-pool

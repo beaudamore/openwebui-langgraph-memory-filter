@@ -2,11 +2,11 @@
 title: LangGraph Memory Graph - Enterprise
 author: beaudamore
 date: 2026-01-10
-version: 2.1.0
+version: 3.0
 license: MIT
 description: LLM-powered semantic memory merge with PostgreSQL persistence
-required_open_webui_version: >= 0.5.0
-requirements: langgraph>=1.0.0, langgraph-checkpoint-postgres, psycopg[binary], psycopg-pool
+required_open_webui_version: >= 0.11.0
+requirements: langgraph~=0.6.11, langgraph-sdk<0.4, langgraph-checkpoint-postgres<3, psycopg[binary], psycopg-pool
 """
 
 from __future__ import annotations
@@ -287,6 +287,119 @@ PII_SUBJECT_BLOCKLIST = {
 }
 
 
+# Default cap on characters of a single message passed to the relevance/
+# extraction models. The filter normally derives the cap from the model's
+# context size (see Filter._message_char_budget); this is the last-resort
+# default. Attached documents are prepended to the user message as text by
+# Open WebUI (RAG_SYSTEM_CONTEXT=False), so a large doc could otherwise push
+# the small helper models past their context window.
+MAX_MESSAGE_CHARS = 12000
+
+
+def content_to_text(content: Any, max_chars: int = MAX_MESSAGE_CHARS) -> str:
+    """
+    Flatten an Open WebUI message `content` field to plain text.
+
+    When a user attaches an image, `content` is a list of parts
+    ({"type": "text", ...}, {"type": "image_url", ...}) instead of a string.
+    Only the text parts are kept; image data is dropped so it never reaches
+    the PII regexes or the extraction/relevance models. The result is
+    truncated to `max_chars` so attached-document text cannot overflow the
+    helper models' context.
+    """
+    if content is None:
+        text = ""
+    elif isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and part.get("type") == "text":
+                parts.append(str(part.get("text", "")))
+        text = "\n".join(p for p in parts if p)
+    elif isinstance(content, dict) and content.get("type") == "text":
+        text = str(content.get("text", ""))
+    else:
+        text = str(content)
+    if max_chars and len(text) > max_chars:
+        text = text[:max_chars] + "\n[... truncated ...]"
+    return text
+
+
+def _fact_key(fact: Dict[str, Any]) -> tuple:
+    """Identity of a fact for upsert purposes: normalized type + subject."""
+    return (
+        str(fact.get("type", "other")).strip().lower(),
+        str(fact.get("subject", "")).strip().lower(),
+    )
+
+
+def _fact_marked_removed(fact: Dict[str, Any]) -> bool:
+    """True when the extraction model explicitly asks to drop this fact."""
+    if fact.get("remove") is True or fact.get("removed") is True:
+        return True
+    status = str(fact.get("status", "")).strip().lower()
+    return status in ("removed", "remove", "deleted", "superseded", "obsolete")
+
+
+def upsert_facts(
+    existing: List[Dict[str, Any]],
+    incoming: List[Dict[str, Any]],
+    logger_fn: Optional[Callable[[str], None]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Merge `incoming` (the model's output) onto `existing` without losing facts.
+
+    - Same type+subject: incoming values overwrite, first_mentioned is kept.
+    - New type+subject: appended.
+    - Existing facts the model omitted: kept untouched.
+    - Incoming fact flagged removed (see _fact_marked_removed): dropped.
+    """
+    log = logger_fn or (lambda _m: None)
+    merged: Dict[tuple, Dict[str, Any]] = {}
+    order: List[tuple] = []
+    for f in existing:
+        k = _fact_key(f)
+        if k not in merged:
+            order.append(k)
+        merged[k] = dict(f)
+
+    kept_count = len(merged)
+    updated = added = removed = 0
+    for f in incoming:
+        if not f.get("type") or not f.get("subject"):
+            continue
+        k = _fact_key(f)
+        if _fact_marked_removed(f):
+            if k in merged:
+                del merged[k]
+                order.remove(k)
+                removed += 1
+                log(f"removed fact {k}")
+            continue
+        clean = {kk: v for kk, v in f.items() if kk not in ("remove", "removed", "status")}
+        if k in merged:
+            prev = merged[k]
+            clean.setdefault("first_mentioned", prev.get("first_mentioned"))
+            if clean.get("first_mentioned") is None:
+                clean.pop("first_mentioned", None)
+            # Keep the stored spelling of type/subject; only the content changes
+            merged[k] = {**prev, **clean, "type": prev["type"], "subject": prev["subject"]}
+            updated += 1
+        else:
+            merged[k] = clean
+            order.append(k)
+            added += 1
+    omitted = kept_count - (updated + removed)
+    log(
+        f"upsert: {updated} updated, {added} added, {removed} removed, "
+        f"{omitted} existing kept (not returned by model)"
+    )
+    return [merged[k] for k in order]
+
+
 def detect_pii(text: str, patterns: Optional[List[str]] = None) -> List[Dict[str, str]]:
     """
     Detect PII in text. Returns list of matches with type and matched value.
@@ -540,6 +653,24 @@ class Filter:
         relevance_model_max_tokens: int = Field(
             default=1000, description="Max tokens for relevance model response"
         )
+        merge_mode: Literal["upsert", "replace"] = Field(
+            default="upsert",
+            description=(
+                "How the extraction model's merged facts are applied. 'upsert' keeps every "
+                "existing fact the model did not return, updates facts with the same "
+                "type+subject, and drops a fact only when the model returns it with "
+                "\"remove\": true (or \"status\": \"removed\"). 'replace' trusts the model's "
+                "list as the full state (old behaviour; a forgetful model silently loses facts)."
+            ),
+        )
+        max_message_chars: int = Field(
+            default=12000,
+            description=(
+                "Fallback cap on characters per message sent to the relevance/extraction "
+                "models when the model's context size cannot be read from Open WebUI's "
+                "model registry (llama.cpp reports meta.n_ctx). 0 disables the fallback cap."
+            ),
+        )
         always_inject_types: List[str] = Field(
             default=["identity"],
             description="Fact types that ALWAYS get injected regardless of relevance filtering. Identity facts (name, job, location) are usually always useful.",
@@ -570,6 +701,55 @@ class Filter:
         # Extraction result is computed in async _update_user_memory_state
         # and processed by sync _extract_information_node
         self._extraction_result = None
+
+    def _get_model_context_tokens(self, request: Any, model_id: str) -> Optional[int]:
+        """
+        Read the context window (tokens) of `model_id` from Open WebUI's model
+        registry. Follows a preset's base_model_id to the upstream entry;
+        llama.cpp exposes meta.n_ctx (loaded context) and meta.n_ctx_train.
+        Returns None when nothing is reported.
+        """
+        try:
+            models = getattr(getattr(request, "app", None), "state", None)
+            models = getattr(models, "MODELS", None) or {}
+            seen = set()
+            while model_id and model_id not in seen and model_id in models:
+                seen.add(model_id)
+                entry = models[model_id] or {}
+                info = entry.get("info") or {}
+                params = info.get("params") or {}
+                # Explicit per-model setting wins (Ollama-style num_ctx)
+                if isinstance(params.get("num_ctx"), int) and params["num_ctx"] > 0:
+                    return params["num_ctx"]
+                for key in ("openai", "ollama"):
+                    meta = (entry.get(key) or {}).get("meta") or {}
+                    n_ctx = meta.get("n_ctx") or meta.get("context_length")
+                    if isinstance(n_ctx, int) and n_ctx > 0:
+                        return n_ctx
+                if isinstance(entry.get("context_length"), int):
+                    return entry["context_length"]
+                model_id = info.get("base_model_id")
+        except Exception as e:
+            self._log(f"Could not read context size for {model_id}: {e}", "debug")
+        return None
+
+    def _message_char_budget(
+        self, request: Any, model_id: str, n_messages: int
+    ) -> int:
+        """
+        Characters allowed per message for a prompt to `model_id`.
+        Half the model context is reserved for conversation text, at a
+        conservative 3 chars/token, split across `n_messages`. Falls back to
+        the max_message_chars valve when the context size is unknown.
+        """
+        ctx = self._get_model_context_tokens(request, model_id)
+        if ctx:
+            budget = int(ctx * 3 * 0.5) // max(1, n_messages)
+            self._log(
+                f"Context for {model_id}: {ctx} tokens -> {budget} chars/message", "debug"
+            )
+            return budget
+        return self.valves.max_message_chars
 
     def _log(self, message: str, level: str = "info"):
         """Centralized logging"""
@@ -768,8 +948,9 @@ class Filter:
         """
         Process LLM-merged facts into state (sync for LangGraph).
 
-        The LLM has already merged existing facts with new extractions.
-        This node REPLACES all facts with the merged result.
+        The LLM has already merged existing facts with new extractions, and
+        _update_user_memory_state has upserted that onto the stored facts
+        (merge_mode valve). This node writes that list into state.
         """
 
         self._log("=== PROCESS_MERGED NODE ENTERED ===", "info")
@@ -1156,12 +1337,13 @@ class Filter:
                 )
                 messages_for_extraction = []
                 for msg in new_messages:
+                    original_content = content_to_text(msg.get("content", ""), max_chars=0)
                     scrubbed_content = scrub_pii(
-                        msg.get("content", ""),
+                        original_content,
                         replacement="[REDACTED]",
                         patterns=self.valves.pii_patterns_enabled,
                     )
-                    if scrubbed_content != msg.get("content", ""):
+                    if scrubbed_content != original_content:
                         self._log("PII pre-scrub: redacted PII in message", "info")
                     messages_for_extraction.append({**msg, "content": scrubbed_content})
 
@@ -1232,6 +1414,18 @@ NEW CONVERSATION:
                     )
                 else:
                     self._log("PII post-validation: all facts clean", "debug")
+
+            # =====================================================================
+            # UPSERT: never lose existing facts because the model forgot to echo
+            # them back. Facts are keyed on type+subject; removal must be explicit.
+            # =====================================================================
+            if merged_data is not None and self.valves.merge_mode == "upsert":
+                new_facts = upsert_facts(
+                    existing_facts,
+                    new_facts,
+                    logger_fn=lambda msg: self._log(f"Merge {msg}", "info"),
+                )
+                merged_data = {**merged_data, "facts": new_facts}
 
             # Compare facts - skip graph invoke if no changes
             def facts_equal(old_facts: List[Dict], new_facts: List[Dict]) -> bool:
@@ -1328,10 +1522,13 @@ NEW CONVERSATION:
             return always_facts
 
         # Build the conversation context (last few messages)
+        window = [m for m in messages[-6:] if m.get("role") in ("user", "assistant")]
+        per_msg = self._message_char_budget(
+            request, self.valves.relevance_model_id, len(window)
+        )
         recent_conversation = [
-            {"role": m.get("role"), "content": m.get("content")}
-            for m in messages[-6:]
-            if m.get("role") in ("user", "assistant")
+            {"role": m.get("role"), "content": content_to_text(m.get("content"), per_msg)}
+            for m in window
         ]
 
         relevance_prompt = f"""STORED FACTS:
@@ -1680,10 +1877,13 @@ I'll use this context to personalize my responses."""
                 # Get recent USER messages only for extraction
                 # CRITICAL: Do NOT include system messages - they contain speaker personas
                 # that the extraction model might incorrectly interpret as user facts
+                user_window = [m for m in messages[-10:] if m.get("role") == "user"]
+                per_msg = self._message_char_budget(
+                    __request__, self.valves.extraction_model_id, len(user_window)
+                )
                 recent_messages = [
-                    {"role": msg.get("role"), "content": msg.get("content")}
-                    for msg in messages[-10:]
-                    if msg.get("role") == "user"
+                    {"role": msg.get("role"), "content": content_to_text(msg.get("content"), per_msg)}
+                    for msg in user_window
                 ]
 
                 # Update memory - await it to catch errors (extraction is important!)
