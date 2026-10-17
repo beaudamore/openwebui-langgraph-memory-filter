@@ -137,6 +137,23 @@ The filter has configurable "valves" (settings):
 
 See [PII Protection](#-pii-protection) for details on privacy filtering.
 
+## 📍 Where the memories are injected (2026-10-16)
+
+The inlet adds the recalled memories to the outgoing request only; the stored chat never contains them. The valve
+`memory_injection_position` decides where they go, and that decides how much of the server's prompt cache survives
+between turns (llama.cpp reuses the longest identical token prefix; the hybrid Qwen3.8 can only resume from a saved
+context checkpoint at or before the first changed token):
+
+| Value | Placement | Cache effect | Template requirement |
+|---|---|---|---|
+| `in_last_user` (default) | appended to the latest user message under `[Relevant memories about the user]` | persona, tool specs and history stay identical; only the block and the new message are prefilled; survives Open WebUI's tool-call continuation requests (not re-filtered) | none |
+| `after_last_user` | own `system` message right after the latest user message | same intent, but **Open WebUI merges extra system messages into the first one** before sending, which puts the block back at the top (measured 2026-10-16); only for clients that pass messages through untouched | template must render a non-first system message (llama.cpp patched Qwen template: yes; oMLX pack: yes; MTPLX stock: raises) |
+| `system_start` | prepended to the first system message (old behaviour) | any change in the recalled set re-prefills the whole conversation (measured 65 s at 12.5k tokens) | none |
+
+Server side, `--checkpoint-min-step 2048` on the llama.cpp chat server bounds the redo when the prompt changes mid-way
+(details in `~/Source/local-llm-config/README.md`, "Prompt cache, checkpoints and the memory filter").
+The installed copy is the DB function `langgraph_memory_graph` and equals `filter/langgraph_memory_filter_v0.11.0.py`.
+
 ## 🧪 Testing
 
 ### Verify Dependencies
