@@ -611,6 +611,23 @@ class Filter:
         show_injected_memories: bool = Field(
             default=False, description="Show which memories were injected (debug mode)"
         )
+        memory_injection_position: Literal[
+            "after_last_user", "in_last_user", "system_start"
+        ] = Field(
+            default="in_last_user",
+            description=(
+                "Where the recalled memories go in the outgoing request (2026-10-16). "
+                "'in_last_user' (default): appended to the latest user message's content under a 'Relevant memories' "
+                "header. The persona system prompt, tool specs and chat history stay byte-identical turn to turn, so the "
+                "server reuses its prompt cache; works with every chat template; and the block survives Open WebUI's "
+                "tool-call continuation requests, which are not filtered again. "
+                "'after_last_user': a separate system message after the latest user message. Open WebUI merges extra "
+                "system messages into the first one before sending, which puts the block back at the top (measured "
+                "2026-10-16), so this only works for clients that send the messages untouched. "
+                "'system_start': prepend to the first system message (previous behaviour): any change in the "
+                "recalled set re-prefills the whole conversation (65 s at 12k tokens on the hybrid Qwen3.8)."
+            ),
+        )
 
         # PII Protection
         pii_filter_enabled: bool = Field(
@@ -1803,24 +1820,43 @@ I'll use this context to personalize my responses."""
                 memory_context = self._format_memory_context(filtered_state)
 
                 if memory_context:
-                    # Inject into system message
                     messages = body.get("messages", [])
                     if messages:
-                        # Find or create system message
-                        system_msg = None
-                        for msg in messages:
-                            if msg.get("role") == "system":
-                                system_msg = msg
-                                break
-
-                        if system_msg:
-                            system_msg["content"] = (
-                                f"{memory_context}\n\n{system_msg['content']}"
-                            )
-                        else:
+                        position = self.valves.memory_injection_position
+                        last_user = max(
+                            (i for i, m in enumerate(messages) if m.get("role") == "user"),
+                            default=None,
+                        )
+                        if position == "after_last_user" and last_user is not None:
+                            # Separate system turn after the latest user message. Everything before it
+                            # (persona, tool specs, history) is unchanged from the previous turn, so the
+                            # server's prompt cache covers it; only this block and the new message are prefilled.
                             messages.insert(
-                                0, {"role": "system", "content": memory_context}
+                                last_user + 1,
+                                {"role": "system", "content": memory_context},
                             )
+                        elif position == "in_last_user" and last_user is not None:
+                            # Template-agnostic variant: same cache behaviour, no extra system role.
+                            user_msg = messages[last_user]
+                            content = user_msg.get("content")
+                            block = f"\n\n[Relevant memories about the user]\n{memory_context}"
+                            if isinstance(content, str):
+                                user_msg["content"] = content + block
+                            elif isinstance(content, list):
+                                content.append({"type": "text", "text": block})
+                        else:
+                            # Legacy: prepend to the first system message (or create one at the top).
+                            system_msg = next(
+                                (m for m in messages if m.get("role") == "system"), None
+                            )
+                            if system_msg:
+                                system_msg["content"] = (
+                                    f"{memory_context}\n\n{system_msg['content']}"
+                                )
+                            else:
+                                messages.insert(
+                                    0, {"role": "system", "content": memory_context}
+                                )
 
                         body["messages"] = messages
 
