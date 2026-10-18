@@ -2,7 +2,7 @@
 title: User Memory
 author: beaudamore
 date: 2026-01-10
-version: 5.0
+version: 5.1
 license: MIT
 description: Per-user fact memory. Inlet injects the relevant facts into the latest user message; outlet extracts new facts in the background. One PostgreSQL table, no LangGraph.
 required_open_webui_version: >= 0.11.0
@@ -813,7 +813,11 @@ class Filter:
                     text = scrubbed
                 return {"role": msg.get("role", "user"), "content": text}
 
-            merge_prompt = f"""EXISTING FACTS:
+            # Local date of the server (honours the container's TZ), so "this year"
+            # and "last month" resolve the way the user means them.
+            merge_prompt = f"""TODAY: {datetime.now().astimezone().strftime("%Y-%m-%d")}
+
+EXISTING FACTS:
 {json.dumps([_for_prompt(f) for f in existing_facts], indent=2)}
 
 EARLIER MESSAGES (context only, already processed):

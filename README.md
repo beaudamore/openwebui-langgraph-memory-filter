@@ -140,7 +140,7 @@ Reply length of the two helper models is set on their workspace presets (`max_to
 3. Render the picked facts grouped by type and append them to the latest user message (see next section).
 
 **Outlet** (after the reply is streamed): schedule a background task, return immediately. The task sends
-`memory-manager` the stored facts, the previous 3 user messages as context and the latest user message, and asks
+`memory-manager` today's date, the stored facts, the previous 3 user messages as context and the latest user message, and asks
 only for what changes: new facts, updated facts (same type+subject), and `"remove": true` entries. Nothing changes
 on most turns and the reply is `{"facts": []}`. Changes are upserted onto the stored facts (omitted facts are
 kept, removal is explicit) and the user's row is rewritten. Unchanged, empty or unparseable replies write nothing.
@@ -235,7 +235,7 @@ One row per user in table `user_facts` of database `langgraph_memory`:
 | `facts` | jsonb | list of `{type, subject, value, sentiment, confidence, first_mentioned, last_updated}` |
 | `updated_at` | timestamptz | last rewrite |
 
-Facts are unique per user on lower-cased type+subject. The filter creates the table on first use. Every change
+Facts are unique per user on lower-cased type+subject, so the prompt tells the model to give each item of the same kind its own subject (`pet_pepper`, `pet_bunny_boy`). The filter creates the table on first use. Every change
 rewrites the row; there is no history. Until 2026-10-18 the same data lived in LangGraph checkpoint tables
 (279 rows for 15 facts, a full state copy per write); the facts were copied into `user_facts` and the
 checkpoint tables, the `schema_migrations` table and six unused side tables were dropped.
