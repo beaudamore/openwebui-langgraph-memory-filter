@@ -29,8 +29,7 @@ function id is `user_memory`.
 openwebui-langgraph-memory-filter/      # folder name predates the LangGraph removal
 ├── README.md                    # This file
 ├── filter/
-│   ├── user_memory_filter.py    # The filter (installed copy = DB function user_memory)
-│   └── requirements.txt         # psycopg[binary], psycopg-pool
+│   └── user_memory_filter.py    # The filter (installed copy = DB function user_memory)
 ├── docker/
 │   └── docker-compose.langgraph.yml  # PostgreSQL container (langgraph-postgres, db langgraph_memory)
 ├── docs/
@@ -55,10 +54,11 @@ The container, database and role keep their original `langgraph` names; only the
 
 ### 2. Install Dependencies
 
-```bash
-# In your Open WebUI container
-docker exec -it <open-webui-container> pip install "psycopg[binary]" psycopg-pool
-```
+Nothing to install. The filter uses `psycopg` only, which Open WebUI ships with
+(pinned in its own requirements). Default Open WebUI installs do not pip-install
+frontmatter `requirements:` (`ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS` is off),
+so the filter deliberately needs no extra package. Filter 5.1 and earlier needed
+`psycopg-pool`; 5.2 opens one plain connection per query instead.
 
 ### 3. Install the Filter
 
@@ -89,7 +89,7 @@ Quick version:
 - **Open WebUI**: >= 0.11.0 (0.12.3 in use)
 - **Python**: 3.10+
 - **PostgreSQL**: 16+ (provided via Docker)
-- **Dependencies**: `psycopg[binary]`, `psycopg-pool`
+- **Dependencies**: `psycopg[binary]` (bundled with Open WebUI, no install step)
 
 ## 🐳 Docker Setup
 
@@ -259,10 +259,11 @@ The whole filter is one file, `filter/user_memory_filter.py`. Rules that matter 
 pip install "psycopg[binary]"
 ```
 
-**`ModuleNotFoundError: No module named 'psycopg_pool'`**
-```bash
-pip install psycopg-pool
-```
+**`Error loading module: user_memory: No module named 'psycopg_pool'`** on create
+
+You are installing filter 5.1 or older. Use 5.2+, which has no `psycopg-pool`
+dependency. (Workaround for the old version: `pip install psycopg-pool` inside the
+container; it is lost when the container is recreated.)
 
 **`TypeError: expected string or bytes-like object, got 'list'`** in `_update_user_memory_state`, or
 **`request (N tokens) exceeds the available context size`** from the relevance model

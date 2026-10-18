@@ -2,11 +2,11 @@
 title: User Memory
 author: beaudamore
 date: 2026-01-10
-version: 5.1
+version: 5.2
 license: MIT
 description: Per-user fact memory. Inlet injects the relevant facts into the latest user message; outlet extracts new facts in the background. One PostgreSQL table, no LangGraph.
 required_open_webui_version: >= 0.11.0
-requirements: psycopg[binary], psycopg-pool
+requirements: psycopg[binary]
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from urllib.parse import quote_plus
 from pydantic import BaseModel, Field
 from fastapi import Request
 
-import psycopg_pool
+import psycopg
 
 # Open WebUI imports
 from open_webui.models.users import Users
@@ -524,7 +524,7 @@ class Filter:
     def __init__(self):
         self.name = "User Memory"
         self.valves = self.Valves()
-        self._pool: Optional[psycopg_pool.AsyncConnectionPool] = None
+        self._conninfo: Optional[str] = None
         self._init_lock = asyncio.Lock()
         # One lock per user: the outlet's background extraction and the next
         # inlet's facts read for the same user never overlap.
@@ -578,12 +578,20 @@ class Filter:
     # ------------------------------------------------------------------
     # Storage: one row per user in table user_facts (facts JSONB)
     # ------------------------------------------------------------------
+    async def _connect(self) -> psycopg.AsyncConnection:
+        """One plain connection per query. No pool: psycopg ships with Open WebUI,
+        psycopg-pool does not, and frontmatter requirements are not pip-installed
+        on a default Open WebUI install."""
+        return await psycopg.AsyncConnection.connect(
+            self._conninfo, autocommit=True, connect_timeout=15
+        )
+
     async def _init_store(self):
-        """Open the connection pool and create the table on first use."""
-        if self._pool is not None:
+        """Check the connection and create the table on first use."""
+        if self._conninfo is not None:
             return
         async with self._init_lock:
-            if self._pool is not None:
+            if self._conninfo is not None:
                 return
             conninfo = (
                 f"postgresql://{self.valves.postgres_user}:"
@@ -595,15 +603,9 @@ class Filter:
                 f"Connecting to PostgreSQL at {self.valves.postgres_host}:{self.valves.postgres_port}"
             )
             try:
-                pool = psycopg_pool.AsyncConnectionPool(
-                    conninfo=conninfo,
-                    min_size=1,
-                    max_size=5,
-                    open=False,
-                    kwargs={"autocommit": True},
-                )
-                await pool.open(wait=True, timeout=15)
-                async with pool.connection() as conn:
+                async with await psycopg.AsyncConnection.connect(
+                    conninfo, autocommit=True, connect_timeout=15
+                ) as conn:
                     await conn.execute(
                         """
                         CREATE TABLE IF NOT EXISTS user_facts (
@@ -613,7 +615,7 @@ class Filter:
                         )
                         """
                     )
-                self._pool = pool
+                self._conninfo = conninfo
                 self._log("User memory store ready (table user_facts)", "info")
             except Exception as e:
                 self._log(f"Failed to open the memory store: {e}", "error")
@@ -624,7 +626,7 @@ class Filter:
     async def _get_facts(self, user_id: str) -> List[Dict[str, Any]]:
         """All stored facts for the user (empty list when none)."""
         await self._init_store()
-        async with self._pool.connection() as conn:
+        async with await self._connect() as conn:
             cur = await conn.execute(
                 "SELECT facts FROM user_facts WHERE user_id = %s", (user_id,)
             )
@@ -649,7 +651,7 @@ class Filter:
             fact["last_updated"] = now
             fact.setdefault("confidence", 0.8)
             clean.append(fact)
-        async with self._pool.connection() as conn:
+        async with await self._connect() as conn:
             await conn.execute(
                 """
                 INSERT INTO user_facts (user_id, facts, updated_at)
@@ -1122,7 +1124,7 @@ CURRENT CONVERSATION:
             await status("⚠️ Cannot connect to memory database. Check PostgreSQL.", True)
         except ImportError as e:
             self._log(f"Missing dependencies: {e}", "error")
-            await status("⚠️ Missing dependencies. Install: psycopg[binary], psycopg-pool", True)
+            await status("⚠️ Missing dependencies. Install: psycopg[binary]", True)
         except Exception as e:
             self._log(f"Inlet processing error: {type(e).__name__}: {e}", "error")
             import traceback
