@@ -2,7 +2,7 @@
 
 ## Overview
 
-The LangGraph Memory Filter uses an LLM to extract and merge facts about users from conversations. The extraction model receives existing facts plus new conversation, and returns a merged fact list.
+The User Memory filter uses two workspace models: `memory-manager` receives the stored facts, a little context and the latest user message, and returns only the facts that change; `memory-relevance` receives the stored facts and the recent conversation and returns the keys of the facts worth injecting.
 
 ## Setup
 
@@ -11,18 +11,18 @@ The LangGraph Memory Filter uses an LLM to extract and merge facts about users f
 1. Go to **Admin Panel** → **Settings** → **Models**
 2. Click **"+ Add Model"**
 3. Configure:
-   - **Model Name:** `Memory Extractor`
-   - **Model ID:** `memory-extractor`
+   - **Model Name:** `Memory Manager`
+   - **Model ID:** `memory-manager`
    - **Base Model:** (choose one)
      - `gpt-4o-mini` - recommended, best balance
      - `llama3.2:latest` - good for local
      - `qwen2.5:7b` - excellent JSON output
      - `gemini/gemini-1.5-flash` - fast and cheap
-   - **System Prompt:** Copy entire contents of `EXTRACTION_PROMPT.md`
+   - **System Prompt:** Copy entire contents of `MERGE_PROMPT_memory-manager.md`
 
 4. **Advanced Settings:**
    - Temperature: `0.1`
-   - Max Tokens: `2000` (needs room for existing facts + new)
+   - Max Tokens: leave high (the reply lists only changed facts; the filter sets no cap)
    - Top P: `0.9`
 
 5. Save
@@ -45,7 +45,7 @@ This model selects only the memories relevant to the current conversation, avoid
 
 4. **Advanced Settings:**
    - Temperature: `0.1`
-   - Max Tokens: `1000`
+   - Max Tokens: leave high (the reply is a short list of keys; the filter sets no cap)
    - Top P: `0.9`
 
 5. Save
@@ -54,9 +54,9 @@ This model selects only the memories relevant to the current conversation, avoid
 
 ### Step 3: Configure Filter
 
-1. Go to **Workspace** → **Functions** → **LangGraph Memory Graph**
+1. Go to **Admin Panel** → **Functions** → **User Memory**
 2. Set valves:
-   - `extraction_model_id`: `memory-extractor`
+   - `extraction_model_id`: `memory-manager`
    - `relevance_model_id`: `memory-relevance`
    - `relevance_filter_enabled`: `true`
    - `always_inject_types`: `["identity"]` (fact types that bypass filtering)
@@ -80,11 +80,11 @@ The Tesla should replace the Corvette, not add alongside it.
 
 1. **Inlet receives message**
 2. **Load existing facts** from PostgreSQL
-3. **Relevance filter** — call relevance model to select only facts relevant to the current conversation (identity facts always pass through)
-4. **Inject relevant facts** into system message for main model
-5. **Call extraction model** with existing facts + conversation
-6. **Model returns merged facts** (handles updates, removals, additions)
-7. **Store merged facts** back to PostgreSQL
+3. **Relevance filter**: the relevance model returns the `{type, subject}` keys of relevant facts (identity facts always pass; any failure injects all facts)
+4. **Inject** the selected facts, grouped by type, appended to the latest user message
+5. **Reply streams** to the user
+6. **Outlet schedules a background task**: the extraction model gets existing facts + 3 earlier user messages + the latest user message and returns only changes (new, updated, `"remove": true`)
+7. **Upsert and store**: changes are merged onto the stored facts and the user's `user_facts` row is rewritten; no changes, no write
 
 ## Troubleshooting
 
@@ -94,10 +94,13 @@ The filter auto-cleans `\`\`\`json` blocks, but for best results use a model tha
 ### Empty extractions
 Check that conversations contain actual personal information to extract.
 
+### Memory update skipped after a very long paste
+The filter sends the raw message text to the helper models with no length cap. Keep **Paste Large Text as File** enabled in Settings > Interface so long pastes become files (the filter never reads files). A raw paste larger than the helper model's context fails that helper call and the turn's memory update is skipped.
+
 ### Facts not merging properly
-- Increase `extraction_model_max_tokens` valve (needs room for all existing facts)
+- Raise `max_tokens` on the `memory-manager` model preset (the reply must hold every existing fact; no cap is set by the filter)
 - Try a smarter model (gpt-4o-mini works well)
-- Check logs: `docker logs open-webui 2>&1 | grep "LangGraph"`
+- Check logs: `docker logs open-webui 2>&1 | grep "User Memory"`
 
 ### PostgreSQL connection errors
 ```bash
@@ -109,22 +112,16 @@ docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c "SEL
 ```
 
 ### View stored facts
-```sql
-docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory
 
--- Get latest checkpoint for a user
-SELECT 
-    thread_id,
-    checkpoint->'channel_values'->>'facts' as facts,
-    checkpoint->'channel_values'->>'total_facts' as count
-FROM checkpoints 
-ORDER BY checkpoint->>'ts' DESC 
-LIMIT 5;
+```bash
+docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c \
+  "SELECT user_id, jsonb_pretty(facts) FROM user_facts;"
 ```
 
 ### Clear all memories (reset)
-```sql
-TRUNCATE checkpoints, checkpoint_blobs, checkpoint_writes CASCADE;
+
+```bash
+docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c "TRUNCATE user_facts;"
 ```
 
 ## Recommended Models
@@ -146,23 +143,22 @@ User Message
 Load ALL Facts (PostgreSQL)
      ↓
 Relevance Filter (LLM)
-  - Input: all facts + current conversation
-  - Output: relevant facts only
-  - Identity facts bypass this step
+  - Input: non-identity facts as {type, subject, value} + last 6 messages
+  - Output: {type, subject} keys of the relevant facts
      ↓
-Inject Relevant Facts into System Message
+Append Selected Facts to the latest user message
      ↓
 Main Model (with focused memory context)
      ↓
 Response to User
-
-— in parallel during inlet —
-
-Call Extraction Model
-  - Input: ALL existing facts + conversation
-  - Output: merged fact list
      ↓
-Store Merged Facts (PostgreSQL)
+[Outlet Filter] -> background task (reply is not delayed)
+     ↓
+Extraction Model
+  - Input: ALL existing facts + 3 earlier user messages + latest user message
+  - Output: only the facts that change (new / updated / remove)
+     ↓
+Upsert onto stored facts, rewrite the user's row if changed (PostgreSQL table user_facts)
 ```
 
 ### Relevance Filter Configuration
@@ -171,8 +167,6 @@ Store Merged Facts (PostgreSQL)
 |-------|---------|-------------|
 | `relevance_filter_enabled` | `true` | Toggle relevance filtering on/off |
 | `relevance_model_id` | `memory-relevance` | OpenWebUI model for relevance selection |
-| `relevance_model_temperature` | `0.1` | Lower = more consistent selections |
-| `relevance_model_max_tokens` | `1000` | Token budget for relevance response |
 | `always_inject_types` | `["identity"]` | Fact types that always get injected |
 
 To disable relevance filtering and go back to full-dump mode, set `relevance_filter_enabled` to `false`.

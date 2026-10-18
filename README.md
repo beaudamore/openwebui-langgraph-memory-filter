@@ -1,12 +1,14 @@
-# LangGraph Memory Filter for Open WebUI
+# User Memory Filter for Open WebUI
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python&logoColor=white)
 ![OpenWebUI](https://img.shields.io/badge/Open_WebUI-Filter-green)
-![LangGraph](https://img.shields.io/badge/LangGraph-State_Machine-orange)
 ![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Backend-blue?logo=postgresql&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
-A sophisticated persistent memory system for [Open WebUI](https://github.com/open-webui/open-webui) that extracts and maintains user information across conversations using LangGraph and PostgreSQL.
+A persistent per-user memory for [Open WebUI](https://github.com/open-webui/open-webui): facts about the user are
+extracted by a small local model after each reply, stored in one PostgreSQL table, and the relevant ones are
+injected into the next request. LangGraph was removed on 2026-10-18 (see [Storage](#-storage)); the installed
+function id is `user_memory`.
 
 ## Author
 
@@ -15,32 +17,29 @@ A sophisticated persistent memory system for [Open WebUI](https://github.com/ope
 
 ## ✨ Features
 
-- **Persistent Memory**: Remembers user preferences, relationships, goals, interests, and personal information
+- **Persistent Memory**: remembers identity, status, preferences, ownership, relationships, goals, skills and events
+- **Relevance filtering**: a second small model picks which facts matter for the current conversation
+- **Reply never waits for extraction**: extraction runs after the reply as a background task
 - **PII Protection**: 3-layer defense-in-depth filtering prevents storage of phone numbers, SSNs, addresses, credit cards, and other personally identifiable information — while still storing personality traits, preferences, and ownership types
-- **Preference Evolution Tracking**: Tracks how user preferences change over time (e.g., "used to like coffee → now prefers tea")
-- **PostgreSQL Backend**: Reliable, persistent storage with LangGraph checkpoint support
-- **Multi-Model Support**: Works with GPT-4, Llama, Qwen, Gemini, and other extraction models
-- **Schema Versioning**: Built-in migration system for data structure evolution
+- **One table**: `user_facts(user_id, facts jsonb, updated_at)`, no framework, no checkpoint history
 
 ## 📁 Project Structure
 
 ```
-memory_langgraph/
+openwebui-langgraph-memory-filter/      # folder name predates the LangGraph removal
 ├── README.md                    # This file
-├── DEPENDENCY_RESOLUTION.md     # Dependency troubleshooting guide
-├── test_imports.py              # Dependency verification script
 ├── filter/
-│   ├── langgraph_memory_filter.py    # Main filter code
-│   └── requirements-langgraph.txt    # Python dependencies
+│   ├── user_memory_filter.py    # The filter (installed copy = DB function user_memory)
+│   └── requirements.txt         # psycopg[binary], psycopg-pool
 ├── docker/
-│   └── docker-compose.langgraph.yml  # PostgreSQL container
+│   └── docker-compose.langgraph.yml  # PostgreSQL container (langgraph-postgres, db langgraph_memory)
 ├── docs/
-│   ├── LANGGRAPH_SETUP.md            # Full installation guide
 │   ├── EXTRACTION_MODEL_SETUP.md     # Extraction model configuration
-│   ├── AI_DEVELOPMENT_GUIDE.md       # Guide for AI assistants
-│   └── ...
+│   └── ...                           # Older design docs, each headed by a dated "superseded" note
 └── prompt/
-    └── EXTRACTION_PROMPT.md          # Extraction model system prompt
+    ├── MERGE_PROMPT_memory-manager.md  # System prompt of the memory-manager model (extraction)
+    ├── RELEVANCE_PROMPT.md             # System prompt of the memory-relevance model
+    └── INSTRUCTIONS.md                 # Model setup walkthrough
 ```
 
 ## 🚀 Quick Start
@@ -52,56 +51,45 @@ cd docker
 docker-compose -f docker-compose.langgraph.yml up -d
 ```
 
+The container, database and role keep their original `langgraph` names; only the table changed.
+
 ### 2. Install Dependencies
 
 ```bash
 # In your Open WebUI container
-docker exec -it <open-webui-container> pip install \
-  "langgraph~=0.6.11" \
-  "langgraph-sdk<0.4" \
-  "langgraph-checkpoint-postgres<3" \
-  "psycopg[binary]" \
-  psycopg-pool
+docker exec -it <open-webui-container> pip install "psycopg[binary]" psycopg-pool
 ```
 
 ### 3. Install the Filter
 
 1. Go to Open WebUI **Admin Panel** → **Functions**
-2. Click **"+ Add Function"**
-3. Paste the contents of `filter/langgraph_memory_filter.py`
-4. Save and enable the filter
+2. Click **"+ Add Function"**, id `user_memory`
+3. Paste the contents of `filter/user_memory_filter.py`
+4. Save, enable the filter, and attach it to the models that should remember (model → Filters)
 
-### 4. Configure Extraction Model
+### 4. Configure the two helper models
 
-See [docs/EXTRACTION_MODEL_SETUP.md](docs/EXTRACTION_MODEL_SETUP.md) for detailed instructions.
+See [docs/EXTRACTION_MODEL_SETUP.md](docs/EXTRACTION_MODEL_SETUP.md) and [prompt/INSTRUCTIONS.md](prompt/INSTRUCTIONS.md).
 
 Quick version:
-1. Create a custom model in Open WebUI with the system prompt from `prompt/EXTRACTION_PROMPT.md`
-2. Set the filter's `extraction_model_id` valve to your model's ID
+1. Create a workspace model `memory-manager` with the system prompt from `prompt/MERGE_PROMPT_memory-manager.md`
+2. Create a workspace model `memory-relevance` with the system prompt from `prompt/RELEVANCE_PROMPT.md`
+3. The filter's `extraction_model_id` and `relevance_model_id` valves default to those two ids
 
 ## 📖 Documentation
 
 | Document | Description |
 |----------|-------------|
-| [LANGGRAPH_SETUP.md](docs/LANGGRAPH_SETUP.md) | Complete installation and setup guide |
 | [EXTRACTION_MODEL_SETUP.md](docs/EXTRACTION_MODEL_SETUP.md) | Extraction model configuration |
-| [AI_DEVELOPMENT_GUIDE.md](docs/AI_DEVELOPMENT_GUIDE.md) | Guide for AI assistants modifying this code |
-| [MEMORY_FILTER_V2_PLAN.md](docs/MEMORY_FILTER_V2_PLAN.md) | Planned conversation-memory and per-speaker summary architecture |
-| [DEPENDENCY_RESOLUTION.md](DEPENDENCY_RESOLUTION.md) | Dependency troubleshooting |
+| [prompt/INSTRUCTIONS.md](prompt/INSTRUCTIONS.md) | Model setup, flow and troubleshooting |
+| [LANGGRAPH_SETUP.md](docs/LANGGRAPH_SETUP.md), [MEMORY_GRAPH_V4.md](docs/MEMORY_GRAPH_V4.md), [AI_DEVELOPMENT_GUIDE.md](docs/AI_DEVELOPMENT_GUIDE.md), [MEMORY_FILTER_V2_PLAN.md](docs/MEMORY_FILTER_V2_PLAN.md) | Historical (LangGraph era); each starts with a dated note on what no longer applies |
 
 ## 🔧 Requirements
 
-- **Open WebUI**: Latest version
+- **Open WebUI**: >= 0.11.0 (0.12.3 in use)
 - **Python**: 3.10+
 - **PostgreSQL**: 16+ (provided via Docker)
-- **Dependencies**:
-  ```
-  langgraph~=0.6.11          # not 1.x: see DEPENDENCY_RESOLUTION.md (websockets downgrade)
-  langgraph-sdk<0.4
-  langgraph-checkpoint-postgres<3
-  psycopg[binary]
-  psycopg-pool
-  ```
+- **Dependencies**: `psycopg[binary]`, `psycopg-pool`
 
 ## 🐳 Docker Setup
 
@@ -121,46 +109,65 @@ docker-compose -f docker-compose.langgraph.yml up -d
 
 ## ⚙️ Configuration
 
-The filter has configurable "valves" (settings):
+The filter has these valves (2026-10-18). Everything else was removed as dead or harmful configuration;
+see "How it works" below for what is fixed behaviour.
 
 | Valve | Default | Description |
 |-------|---------|-------------|
-| `enable_filter` | `true` | Enable/disable the filter |
-| `postgres_connection_string` | `postgresql://...` | Database connection |
-| `extraction_model_id` | `""` | Model ID for memory extraction |
-| `debug_logging` | `false` | Enable verbose logging |
-| `enable_memory_injection` | `true` | Inject memories into context |
+| `priority` | `10` | Filter order in Open WebUI (lower runs first) |
+| `postgres_host` / `postgres_port` / `postgres_database` / `postgres_user` / `postgres_password` | `langgraph-postgres` / `5432` / `langgraph_memory` / `langgraph` / ... | Where the fact store lives |
+| `extraction_model_id` | `memory-manager` | Workspace model that returns fact changes (prompt: `prompt/MERGE_PROMPT_memory-manager.md`) |
+| `relevance_model_id` | `memory-relevance` | Workspace model that picks relevant facts (prompt: `prompt/RELEVANCE_PROMPT.md`) |
+| `relevance_filter_enabled` | `true` | Off = inject every stored fact |
+| `always_inject_types` | `["identity"]` | Fact types that skip the relevance model |
+| `show_status` | `true` | Status line in the chat while memories load |
 | `pii_filter_enabled` | `true` | Enable PII detection and filtering |
 | `pii_filter_mode` | `"remove"` | `remove` drops facts with PII; `redact` stores with `[REDACTED]` |
 | `pii_scrub_input` | `true` | Scrub PII from messages before sending to extraction model |
 | `pii_patterns_enabled` | all 10 | Which PII types to detect (see PII Protection section) |
+| `debug_mode` | `false` | Debug log lines |
 
-See [PII Protection](#-pii-protection) for details on privacy filtering.
+Per-user valves: `enabled`, `show_status`.
+
+Reply length of the two helper models is set on their workspace presets (`max_tokens`), not by the filter.
+
+## ⚙️ How it works (2026-10-18)
+
+**Inlet** (before the chat model sees the request):
+1. Read the user's facts from PostgreSQL (waits for a still-running extraction from the previous turn).
+2. Send the non-identity facts as `{type, subject, value}` plus the last 6 messages to `memory-relevance`, which
+   answers with the `{type, subject}` keys it picked. Identity facts always pass. Any failure injects all facts.
+3. Render the picked facts grouped by type and append them to the latest user message (see next section).
+
+**Outlet** (after the reply is streamed): schedule a background task, return immediately. The task sends
+`memory-manager` the stored facts, the previous 3 user messages as context and the latest user message, and asks
+only for what changes: new facts, updated facts (same type+subject), and `"remove": true` entries. Nothing changes
+on most turns and the reply is `{"facts": []}`. Changes are upserted onto the stored facts (omitted facts are
+kept, removal is explicit) and the user's row is rewritten. Unchanged, empty or unparseable replies write nothing.
+A per-user lock serialises the task with the next inlet. Only user messages are sent; system prompts carry persona
+text that would be misread as facts.
+
+Measured before this change (2026-10-16 to 10-18, 43 turns): the inlet blocked each reply for a median 36.5 s
+(extraction 27 s, because the model echoed all 15 facts every turn; relevance 10 s, because it copied full
+fact objects back). Both are now out of the reply path or reduced to key lists.
 
 ## 📍 Where the memories are injected (2026-10-16)
 
-The inlet adds the recalled memories to the outgoing request only; the stored chat never contains them. The valve
-`memory_injection_position` decides where they go, and that decides how much of the server's prompt cache survives
-between turns (llama.cpp reuses the longest identical token prefix; the hybrid Qwen3.8 can only resume from a saved
-context checkpoint at or before the first changed token):
+The inlet adds the recalled memories to the outgoing request only; the stored chat never contains them. They are
+appended to the latest user message under a `[Relevant memories about the user]` header. The persona system prompt,
+tool specs and chat history therefore stay byte-identical from turn to turn, so the server reuses its prompt cache
+(llama.cpp reuses the longest identical token prefix); only the block and the new message are prefilled. This works
+with every chat template and survives Open WebUI's tool-call continuation requests, which are not filtered again.
 
-| Value | Placement | Cache effect | Template requirement |
-|---|---|---|---|
-| `in_last_user` (default) | appended to the latest user message under `[Relevant memories about the user]` | persona, tool specs and history stay identical; only the block and the new message are prefilled; survives Open WebUI's tool-call continuation requests (not re-filtered) | none |
-| `after_last_user` | own `system` message right after the latest user message | same intent, but **Open WebUI merges extra system messages into the first one** before sending, which puts the block back at the top (measured 2026-10-16); only for clients that pass messages through untouched | template must render a non-first system message (llama.cpp patched Qwen template: yes; oMLX pack: yes; MTPLX stock: raises) |
-| `system_start` | prepended to the first system message (old behaviour) | any change in the recalled set re-prefills the whole conversation (measured 65 s at 12.5k tokens) | none |
+There is no placement valve (removed 2026-10-18). The alternatives were measured and rejected: a separate system
+message after the user turn is merged by Open WebUI into the first system message before sending, and prepending to
+the system prompt re-prefills the whole conversation whenever the recalled set changes (65 s at 12.5k tokens).
 
 Server side, `--checkpoint-min-step 2048` on the llama.cpp chat server bounds the redo when the prompt changes mid-way
 (details in `~/Source/local-llm-config/README.md`, "Prompt cache, checkpoints and the memory filter").
-The installed copy is the DB function `langgraph_memory_graph` and equals `filter/langgraph_memory_filter_v0.11.0.py`.
+The installed copy is the DB function `user_memory` and equals `filter/user_memory_filter.py`.
 
 ## 🧪 Testing
-
-### Verify Dependencies
-
-```bash
-python test_imports.py
-```
 
 ### Test Database Connection
 
@@ -172,7 +179,15 @@ docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c "SEL
 
 ```bash
 docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c \
-  "SELECT thread_id, checkpoint FROM checkpoints ORDER BY thread_id LIMIT 5;"
+  "SELECT user_id, jsonb_array_length(facts) AS facts, updated_at FROM user_facts;"
+docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c \
+  "SELECT jsonb_pretty(facts) FROM user_facts WHERE user_id = '<user id>';"
+```
+
+### Watch it work
+
+```bash
+docker logs -f open-webui 2>&1 | grep "User Memory"
 ```
 
 ## � PII Protection
@@ -210,41 +225,34 @@ Every extracted fact is scanned for PII in both `subject` and `value` fields, pl
 - Goals, skills, interests, hobbies
 - Professional info ("engineer at Acme" — not employee ID)
 
-## 📊 Schema Version
+## 📊 Storage
 
-**Current: Schema v4** (LLM-Powered Semantic Merge + PII Protection)
+One row per user in table `user_facts` of database `langgraph_memory`:
 
-Schema v4 features:
-- LLM-powered semantic merge replaces code-based deduplication
-- Flexible fact-based storage (replaces rigid type system)
-- 3-layer PII filtering (prompt guardrails, regex pre-scrub, post-extraction validation)
-- `schema_migrations` table for version tracking
+| Column | Type | Meaning |
+|---|---|---|
+| `user_id` | text, primary key | Open WebUI user id |
+| `facts` | jsonb | list of `{type, subject, value, sentiment, confidence, first_mentioned, last_updated}` |
+| `updated_at` | timestamptz | last rewrite |
+
+Facts are unique per user on lower-cased type+subject. The filter creates the table on first use. Every change
+rewrites the row; there is no history. Until 2026-10-18 the same data lived in LangGraph checkpoint tables
+(279 rows for 15 facts, a full state copy per write); the facts were copied into `user_facts` and the
+checkpoint tables, the `schema_migrations` table and six unused side tables were dropped.
 
 ## 🤖 For AI Assistants
 
-If you're an AI assistant modifying this codebase, please read:
-
-📚 **[docs/AI_DEVELOPMENT_GUIDE.md](docs/AI_DEVELOPMENT_GUIDE.md)**
-
-This document contains critical information about:
-- Schema version requirements
-- Pitfalls to avoid
-- Code modification procedures
-- Testing requirements
+The whole filter is one file, `filter/user_memory_filter.py`. Rules that matter when changing it:
+- Anything that reads user intent (forget, update, what is a fact) goes through the extraction model and its
+  prompt, never through regex or keyword matching in code.
+- Prompt changes go into the prompt file **and** the matching `model` table row.
+- No valves for hypothetical setups: one working path. The installed copy is the DB function `user_memory`;
+  keep it byte-identical to the repo file.
+- [docs/AI_DEVELOPMENT_GUIDE.md](docs/AI_DEVELOPMENT_GUIDE.md) is historical (schema versions, LangGraph).
 
 ## 🐛 Troubleshooting
 
 ### Common Errors
-
-**`cannot import name 'RunnableSerializable'`**
-```bash
-pip install "langgraph~=0.6.11"   # langgraph 0.2.x is too old for modern langchain-core
-```
-
-**`cannot import name 'OP_BINARY' from 'websockets.frames'`** (first chat after a container start)
-Caused by langgraph 1.x: its langgraph-sdk 0.4.x pins `websockets<17`, so Open WebUI's startup pip run
-downgrades websockets under the already-running server. Keep the pins above (langgraph 0.6.x,
-langgraph-sdk <0.4), which leave websockets alone.
 
 **`ImportError: no pq wrapper available`**
 ```bash
@@ -261,28 +269,23 @@ pip install psycopg-pool
 Happened when a chat message had an image attached: Open WebUI then sends `content` as a list of
 parts (text + base64 `image_url`) instead of a string, which broke the PII regex scrub and pushed the
 whole image into the relevance prompt. Fixed in the filter (2026-10-14): `content_to_text()` keeps only
-the text parts and drops image data. Each message is also capped by a character budget derived
-from the relevance/extraction model's context size, read from Open WebUI's model registry (llama.cpp
-reports `meta.n_ctx`; presets are followed to their base model). Half the context at 3 chars/token is
-split across the messages in the prompt. When no context size is reported, the `max_message_chars`
-valve (default 12000, 0 = off) is used instead.
+the text parts and drops image data. There is no per-message length cap (removed 2026-10-18): the
+filter never sees attached files (Open WebUI runs file retrieval after the filter inlet), so the only
+oversized input is a raw paste. Keep **Paste Large Text as File** enabled in Settings > Interface; a raw
+paste larger than the helper model's context makes that helper call fail and the filter skips the
+memory update for that turn without writing anything.
 
-**Existing facts disappear after a chat** (e.g. 2 facts in, 2 facts out, but one old fact replaced)
-The extraction model is asked to return the merged fact list and a small model sometimes omits facts it
-was given. Since 2026-10-14 the filter upserts the model's output onto the stored facts (`merge_mode`
-valve, default `upsert`): same type+subject updates the fact and keeps `first_mentioned`, new
-type+subject is appended, and facts the model did not return are kept. A fact is dropped only when
-the model returns it with `"remove": true` or `"status": "removed"`. Set `merge_mode` to `replace`
-for the old trust-the-model behaviour. The memory-manager preset's system prompt must match this
-contract (it is tracked in [prompt/MERGE_PROMPT_memory-manager.md](prompt/MERGE_PROMPT_memory-manager.md)
-and installed in the `model` table): removals are explicit `"remove": true` entries, never omissions.
+**Existing facts disappear after a chat**
+The extraction model is only asked for changes and the filter upserts its output onto the stored facts: same
+type+subject updates the fact and keeps `first_mentioned`, new type+subject is appended, and facts the model did
+not return are kept. A fact is dropped only when the model returns it with `"remove": true` (or `"status":
+"removed"`). The memory-manager preset's system prompt must match this contract (it is tracked in
+[prompt/MERGE_PROMPT_memory-manager.md](prompt/MERGE_PROMPT_memory-manager.md) and installed in the `model` table).
 
 **Forget commands.** Both "forget everything you know about me" and targeted forgets such as
 "forget my cars" go through the extraction model, which must return each matching fact (or every fact)
 with `"remove": true`. The log line `Merge upsert: ... removed` shows what it did. Memory extraction for that message
 was skipped, so re-send the fact in a new message.
-
-See [DEPENDENCY_RESOLUTION.md](DEPENDENCY_RESOLUTION.md) for detailed troubleshooting.
 
 ## 📝 License
 
@@ -291,5 +294,4 @@ MIT License
 ## 🙏 Acknowledgments
 
 - [Open WebUI](https://github.com/open-webui/open-webui) - The amazing AI chat interface
-- [LangGraph](https://github.com/langchain-ai/langgraph) - State machine for LLM applications
-- [LangChain](https://github.com/langchain-ai/langchain) - LLM application framework
+- [psycopg](https://www.psycopg.org/) - PostgreSQL driver

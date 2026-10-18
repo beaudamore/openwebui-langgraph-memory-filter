@@ -1,5 +1,8 @@
 # LangGraph Memory Filter v2 — All-Encompassing Conversation Memory
 
+> **2026-10-18:** Superseded in part. The filter no longer has `SCHEMA_VERSION`/`schema_migrations`, the valves `extraction_threshold`, `max_injected_memories`, `memory_injection_format`, `show_injected_memories`, `merge_mode`, `memory_injection_position`, `max_message_chars`, `extraction_model_max_tokens`, `relevance_model_max_tokens`, or the summary node. Extraction runs in the outlet as a background task and asks only for changed facts. The installed prompt is `prompt/MERGE_PROMPT_memory-manager.md`; `EXTRACTION_PROMPT.md` was removed.  **Later the same day LangGraph was removed entirely:** the filter is now `filter/user_memory_filter.py`, installed as function `user_memory`, storing one row per user in table `user_facts`; the checkpoint tables are gone. See the README for current behaviour.
+
+
 > **Status:** Planning  
 > **Date:** March 12, 2026  
 > **Author:** Beau D'Amore  

@@ -4,11 +4,11 @@
 
 ## Overview
 
-The LangGraph Memory Filter uses OpenWebUI's internal model system to extract user information from conversations. This guide shows you how to configure the extraction model for optimal results.
+The User Memory filter uses OpenWebUI's internal model system to extract user information from conversations. This guide shows you how to configure the extraction model for optimal results.
 
 **Key Feature (Schema v2):** Preferences are tracked as timestamped data points for evolution tracking. The same preference extracted multiple times creates multiple entries to show how opinions change over time.
 
-**PII Protection:** The filter includes 3-layer PII filtering. Even if the extraction model returns PII, it will be caught and removed/redacted by the post-extraction validator. The extraction prompt should include PII policy instructions — see `prompt/EXTRACTION_PROMPT.md` for the reference prompt with PII policy.
+**PII Protection:** The filter includes 3-layer PII filtering. Even if the extraction model returns PII, it will be caught and removed/redacted by the post-extraction validator. The extraction prompt should include PII policy instructions — see `prompt/MERGE_PROMPT_memory-manager.md` for the reference prompt with PII policy.
 
 ---
 
@@ -48,7 +48,7 @@ Create a dedicated model in OpenWebUI with a system prompt optimized for memory 
 2. Click **"+ Add Model"**
 3. Configure:
    - **Name:** `Memory Extractor`
-   - **Model ID:** `memory-extractor` (or any unique ID)
+   - **Model ID:** `memory-manager` (the filter default)
    - **Base Model:** Choose a good JSON model (e.g., `llama3.2:latest`, `gpt-4o-mini`)
    - **System Prompt:** See below
 
@@ -150,12 +150,11 @@ Remember: Return ONLY the JSON object. No markdown, no explanations.
 
 #### **Step 3: Configure Filter**
 
-1. Go to **Settings** → **Functions** → **LangGraph Memory Graph**
+1. Go to **Admin Panel** → **Functions** → **User Memory**
 2. Set valve:
    ```yaml
-   extraction_model_id: "memory-extractor"
+   extraction_model_id: "memory-manager"
    extraction_model_temperature: 0.1  # Low for consistent JSON
-   extraction_model_max_tokens: 1000
    ```
 
 ---
