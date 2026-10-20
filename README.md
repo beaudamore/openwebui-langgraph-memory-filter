@@ -21,7 +21,7 @@ function id is `user_memory`.
 - **Relevance filtering**: a second small model picks which facts matter for the current conversation
 - **Reply never waits for extraction**: extraction runs after the reply as a background task
 - **PII Protection**: 3-layer defense-in-depth filtering prevents storage of phone numbers, SSNs, addresses, credit cards, and other personally identifiable information — while still storing personality traits, preferences, and ownership types
-- **One table**: `user_facts(user_id, facts jsonb, updated_at)`, no framework, no checkpoint history
+- **One table**: `user_facts`, one row per fact keyed on user + type + subject, no framework, no checkpoint history
 
 ## 📁 Project Structure
 
@@ -142,8 +142,8 @@ Reply length of the two helper models is set on their workspace presets (`max_to
 **Outlet** (after the reply is streamed): schedule a background task, return immediately. The task sends
 `memory-manager` today's date, the stored facts, the previous 3 user messages as context and the latest user message, and asks
 only for what changes: new facts, updated facts (same type+subject), and `"remove": true` entries. Nothing changes
-on most turns and the reply is `{"facts": []}`. Changes are upserted onto the stored facts (omitted facts are
-kept, removal is explicit) and the user's row is rewritten. Unchanged, empty or unparseable replies write nothing.
+on most turns and the reply is `{"facts": []}`. Each change is applied to its own row (omitted facts are
+kept, removal is a `DELETE`, a fact identical to the stored one is not written). Empty or unparseable replies write nothing.
 A per-user lock serialises the task with the next inlet. Only user messages are sent; system prompts carry persona
 text that would be misread as facts.
 
@@ -179,9 +179,14 @@ docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c "SEL
 
 ```bash
 docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c \
-  "SELECT user_id, jsonb_array_length(facts) AS facts, updated_at FROM user_facts;"
+  "SELECT user_id, count(*) AS facts, max(last_updated) FROM user_facts GROUP BY user_id;"
 docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c \
-  "SELECT jsonb_pretty(facts) FROM user_facts WHERE user_id = '<user id>';"
+  "SELECT type, subject, value, sentiment, confidence, first_mentioned, last_updated
+   FROM user_facts WHERE user_id = '<user id>' ORDER BY first_mentioned;"
+# fix one fact by hand
+docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c \
+  "UPDATE user_facts SET value = 'in 50s', last_updated = now()
+   WHERE user_id = '<user id>' AND type = 'identity' AND subject = 'age';"
 ```
 
 ### Watch it work
@@ -227,18 +232,26 @@ Every extracted fact is scanned for PII in both `subject` and `value` fields, pl
 
 ## 📊 Storage
 
-One row per user in table `user_facts` of database `langgraph_memory`:
+One row per fact in table `user_facts` of database `langgraph_memory`:
 
 | Column | Type | Meaning |
 |---|---|---|
-| `user_id` | text, primary key | Open WebUI user id |
-| `facts` | jsonb | list of `{type, subject, value, sentiment, confidence, first_mentioned, last_updated}` |
-| `updated_at` | timestamptz | last rewrite |
+| `user_id` | text | Open WebUI user id |
+| `type` | text | fact type, stored lower-cased |
+| `subject` | text | fact subject, stored lower-cased |
+| `value` | text | the fact |
+| `sentiment` | text, nullable | `positive`, `negative`, `neutral` |
+| `confidence` | real, default 0.8 | model's confidence |
+| `first_mentioned` | timestamptz | row insert time |
+| `last_updated` | timestamptz | last time value, sentiment or confidence changed |
 
-Facts are unique per user on lower-cased type+subject, so the prompt tells the model to give each item of the same kind its own subject (`pet_pepper`, `pet_bunny_boy`). The filter creates the table on first use. Every change
-rewrites the row; there is no history. Until 2026-10-18 the same data lived in LangGraph checkpoint tables
-(279 rows for 15 facts, a full state copy per write); the facts were copied into `user_facts` and the
-checkpoint tables, the `schema_migrations` table and six unused side tables were dropped.
+Primary key `(user_id, type, subject)`, so the prompt tells the model to give each item of the same kind its own
+subject (`pet_pepper`, `pet_bunny_boy`). The filter creates the table on first use. Each change from the
+extraction model is one `INSERT ... ON CONFLICT DO UPDATE` (only when something differs) or one `DELETE`, all in
+one transaction; there is no history. History of the layout: until 2026-10-18 the data lived in LangGraph
+checkpoint tables (279 rows for 15 facts, a full state copy per write); from 2026-10-18 to 2026-10-19 it was one
+row per user with a `facts` JSONB list, which made single-fact edits positional and stamped every fact's
+`last_updated` on every write; on 2026-10-19 the 27 facts were migrated to one row each.
 
 ## 🤖 For AI Assistants
 

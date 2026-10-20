@@ -84,7 +84,7 @@ The Tesla should replace the Corvette, not add alongside it.
 4. **Inject** the selected facts, grouped by type, appended to the latest user message
 5. **Reply streams** to the user
 6. **Outlet schedules a background task**: the extraction model gets existing facts + 3 earlier user messages + the latest user message and returns only changes (new, updated, `"remove": true`)
-7. **Upsert and store**: changes are merged onto the stored facts and the user's `user_facts` row is rewritten; no changes, no write
+7. **Apply and store**: each change becomes one row insert, update or delete in `user_facts`; identical facts are not written
 
 ## Troubleshooting
 
@@ -115,7 +115,7 @@ docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c "SEL
 
 ```bash
 docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c \
-  "SELECT user_id, jsonb_pretty(facts) FROM user_facts;"
+  "SELECT user_id, type, subject, value, last_updated FROM user_facts ORDER BY user_id, first_mentioned;"
 ```
 
 ### Clear all memories (reset)
@@ -158,7 +158,7 @@ Extraction Model
   - Input: ALL existing facts + 3 earlier user messages + latest user message
   - Output: only the facts that change (new / updated / remove)
      ↓
-Upsert onto stored facts, rewrite the user's row if changed (PostgreSQL table user_facts)
+Apply each change to its own row in PostgreSQL table user_facts (insert / update / delete)
 ```
 
 ### Relevance Filter Configuration

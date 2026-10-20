@@ -2,9 +2,9 @@
 title: User Memory
 author: beaudamore
 date: 2026-01-10
-version: 5.2
+version: 6.0
 license: MIT
-description: Per-user fact memory. Inlet injects the relevant facts into the latest user message; outlet extracts new facts in the background. One PostgreSQL table, no LangGraph.
+description: Per-user fact memory. Inlet injects the relevant facts into the latest user message; outlet extracts new facts in the background. One PostgreSQL table, one row per fact, no LangGraph.
 required_open_webui_version: >= 0.11.0
 requirements: psycopg[binary]
 """
@@ -31,10 +31,11 @@ from open_webui.utils.chat import generate_chat_completion
 logger = logging.getLogger("openwebui.filters.user_memory")
 logger.setLevel(logging.INFO)
 
-# A fact is a dict: {type, subject, value, sentiment, confidence, first_mentioned, last_updated}.
-# Types the extraction prompt uses: identity, status, preference, ownership, relationship,
-# goal, skill, event. Any type string is accepted and rendered. Facts are unique per user
-# on lower-cased (type, subject); see _fact_key / upsert_facts.
+# A fact is a dict: {type, subject, value, sentiment, confidence, first_mentioned, last_updated},
+# one row per fact in table user_facts. Types the extraction prompt uses: identity, status,
+# preference, ownership, relationship, goal, skill, event. Any type string is accepted and
+# rendered. Facts are unique per user on lower-cased (type, subject), which is how they are
+# stored; see _fact_key.
 
 
 # ============================================================================
@@ -222,62 +223,6 @@ def _fact_marked_removed(fact: Dict[str, Any]) -> bool:
         return True
     status = str(fact.get("status", "")).strip().lower()
     return status in ("removed", "remove", "deleted", "superseded", "obsolete")
-
-
-def upsert_facts(
-    existing: List[Dict[str, Any]],
-    incoming: List[Dict[str, Any]],
-    logger_fn: Optional[Callable[[str], None]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Merge `incoming` (the model's output) onto `existing` without losing facts.
-
-    - Same type+subject: incoming values overwrite, first_mentioned is kept.
-    - New type+subject: appended.
-    - Existing facts the model omitted: kept untouched.
-    - Incoming fact flagged removed (see _fact_marked_removed): dropped.
-    """
-    log = logger_fn or (lambda _m: None)
-    merged: Dict[tuple, Dict[str, Any]] = {}
-    order: List[tuple] = []
-    for f in existing:
-        k = _fact_key(f)
-        if k not in merged:
-            order.append(k)
-        merged[k] = dict(f)
-
-    kept_count = len(merged)
-    updated = added = removed = 0
-    for f in incoming:
-        if not f.get("type") or not f.get("subject"):
-            continue
-        k = _fact_key(f)
-        if _fact_marked_removed(f):
-            if k in merged:
-                del merged[k]
-                order.remove(k)
-                removed += 1
-                log(f"removed fact {k}")
-            continue
-        clean = {kk: v for kk, v in f.items() if kk not in ("remove", "removed", "status")}
-        if k in merged:
-            prev = merged[k]
-            clean.setdefault("first_mentioned", prev.get("first_mentioned"))
-            if clean.get("first_mentioned") is None:
-                clean.pop("first_mentioned", None)
-            # Keep the stored spelling of type/subject; only the content changes
-            merged[k] = {**prev, **clean, "type": prev["type"], "subject": prev["subject"]}
-            updated += 1
-        else:
-            merged[k] = clean
-            order.append(k)
-            added += 1
-    omitted = kept_count - (updated + removed)
-    log(
-        f"upsert: {updated} updated, {added} added, {removed} removed, "
-        f"{omitted} existing kept (not returned by model)"
-    )
-    return [merged[k] for k in order]
 
 
 def detect_pii(text: str, patterns: Optional[List[str]] = None) -> List[Dict[str, str]]:
@@ -576,7 +521,7 @@ class Filter:
             return None
 
     # ------------------------------------------------------------------
-    # Storage: one row per user in table user_facts (facts JSONB)
+    # Storage: one row per fact in table user_facts
     # ------------------------------------------------------------------
     async def _connect(self) -> psycopg.AsyncConnection:
         """One plain connection per query. No pool: psycopg ships with Open WebUI,
@@ -609,9 +554,15 @@ class Filter:
                     await conn.execute(
                         """
                         CREATE TABLE IF NOT EXISTS user_facts (
-                            user_id    TEXT PRIMARY KEY,
-                            facts      JSONB NOT NULL DEFAULT '[]'::jsonb,
-                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                            user_id         TEXT        NOT NULL,
+                            type            TEXT        NOT NULL,
+                            subject         TEXT        NOT NULL,
+                            value           TEXT        NOT NULL,
+                            sentiment       TEXT,
+                            confidence      REAL        NOT NULL DEFAULT 0.8,
+                            first_mentioned TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            last_updated    TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            PRIMARY KEY (user_id, type, subject)
                         )
                         """
                     )
@@ -624,45 +575,98 @@ class Filter:
                 )
 
     async def _get_facts(self, user_id: str) -> List[Dict[str, Any]]:
-        """All stored facts for the user (empty list when none)."""
+        """All stored facts for the user, oldest first (empty list when none)."""
         await self._init_store()
         async with await self._connect() as conn:
             cur = await conn.execute(
-                "SELECT facts FROM user_facts WHERE user_id = %s", (user_id,)
-            )
-            row = await cur.fetchone()
-        facts = row[0] if row else []
-        if not isinstance(facts, list):
-            self._log(f"Stored facts for {user_id[:8]}... are not a list - treating as empty", "warning")
-            return []
-        return facts
-
-    async def _save_facts(self, user_id: str, facts: List[Dict[str, Any]]) -> int:
-        """Replace the user's fact list. Stamps first_mentioned/last_updated/confidence."""
-        await self._init_store()
-        now = datetime.now(timezone.utc).isoformat()
-        clean: List[Dict[str, Any]] = []
-        for fact in facts:
-            if not fact.get("type") or not fact.get("subject"):
-                self._log(f"Skipping fact without type/subject: {fact}", "warning")
-                continue
-            fact = dict(fact)
-            fact.setdefault("first_mentioned", now)
-            fact["last_updated"] = now
-            fact.setdefault("confidence", 0.8)
-            clean.append(fact)
-        async with await self._connect() as conn:
-            await conn.execute(
                 """
-                INSERT INTO user_facts (user_id, facts, updated_at)
-                VALUES (%s, %s::jsonb, now())
-                ON CONFLICT (user_id) DO UPDATE
-                    SET facts = EXCLUDED.facts, updated_at = now()
+                SELECT type, subject, value, sentiment, confidence,
+                       first_mentioned, last_updated
+                FROM user_facts
+                WHERE user_id = %s
+                ORDER BY first_mentioned, type, subject
                 """,
-                (user_id, json.dumps(clean)),
+                (user_id,),
             )
-        self._log(f"Stored {len(clean)} facts for user {user_id[:8]}...", "info")
-        return len(clean)
+            rows = await cur.fetchall()
+        return [
+            {
+                "type": type_,
+                "subject": subject,
+                "value": value,
+                "sentiment": sentiment,
+                "confidence": confidence,
+                "first_mentioned": first_mentioned.isoformat(),
+                "last_updated": last_updated.isoformat(),
+            }
+            for type_, subject, value, sentiment, confidence, first_mentioned, last_updated in rows
+        ]
+
+    async def _apply_changes(
+        self, user_id: str, changes: List[Dict[str, Any]]
+    ) -> Dict[str, int]:
+        """
+        Apply the extraction model's change list, one row per fact, in one transaction.
+
+        - Fact flagged removed (see _fact_marked_removed): DELETE by key.
+        - Otherwise INSERT, or UPDATE value/sentiment/confidence when any of them differs.
+          An unchanged fact is not touched, so last_updated only moves when the fact did.
+        - Facts the model did not mention are left alone.
+        Returns counts: updated, added, removed, skipped.
+        """
+        await self._init_store()
+        counts = {"updated": 0, "added": 0, "removed": 0, "skipped": 0}
+        async with await self._connect() as conn:
+            async with conn.transaction():
+                for fact in changes:
+                    type_, subject = _fact_key(fact)
+                    if not type_ or not subject:
+                        self._log(f"Skipping fact without type/subject: {fact}", "warning")
+                        counts["skipped"] += 1
+                        continue
+                    if _fact_marked_removed(fact):
+                        cur = await conn.execute(
+                            "DELETE FROM user_facts WHERE user_id = %s AND type = %s AND subject = %s",
+                            (user_id, type_, subject),
+                        )
+                        counts["removed"] += cur.rowcount
+                        continue
+                    value = str(fact.get("value") or "").strip()
+                    if not value:
+                        self._log(f"Skipping fact without value: {fact}", "warning")
+                        counts["skipped"] += 1
+                        continue
+                    sentiment = str(fact.get("sentiment") or "").strip().lower() or None
+                    try:
+                        confidence = float(fact.get("confidence", 0.8))
+                    except (TypeError, ValueError):
+                        confidence = 0.8
+                    cur = await conn.execute(
+                        """
+                        INSERT INTO user_facts (user_id, type, subject, value, sentiment, confidence)
+                        VALUES (%s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id, type, subject) DO UPDATE
+                            SET value        = EXCLUDED.value,
+                                sentiment    = EXCLUDED.sentiment,
+                                confidence   = EXCLUDED.confidence,
+                                last_updated = now()
+                            WHERE user_facts.value      IS DISTINCT FROM EXCLUDED.value
+                               OR user_facts.sentiment  IS DISTINCT FROM EXCLUDED.sentiment
+                               OR user_facts.confidence IS DISTINCT FROM EXCLUDED.confidence
+                        RETURNING (xmax = 0) AS inserted
+                        """,
+                        (user_id, type_, subject, value, sentiment, confidence),
+                    )
+                    row = await cur.fetchone()
+                    if row is None:
+                        continue  # identical to the stored fact: not written
+                    counts["added" if row[0] else "updated"] += 1
+        self._log(
+            f"Applied changes for user {user_id[:8]}...: {counts['updated']} updated, "
+            f"{counts['added']} added, {counts['removed']} removed, {counts['skipped']} skipped",
+            "info",
+        )
+        return counts
 
     def _user_lock(self, user_id: str) -> asyncio.Lock:
         lock = self._user_locks.get(user_id)
@@ -788,8 +792,8 @@ class Filter:
         request: Optional[Any] = None,
     ):
         """
-        Ask the extraction model which facts change because of `new_message`,
-        upsert that onto the stored facts, and persist when something changed.
+        Ask the extraction model which facts change because of `new_message`
+        and apply those changes row by row (see _apply_changes).
         Runs in the background after the reply (see outlet).
         """
         try:
@@ -879,31 +883,21 @@ NEW MESSAGE:
                 self._log("No changes - skipping store", "info")
                 return
 
-            new_facts = upsert_facts(
-                existing_facts,
-                changes,
-                logger_fn=lambda msg: self._log(f"Merge {msg}", "info"),
+            counts = await asyncio.wait_for(
+                self._apply_changes(user_id, changes), timeout=30.0
             )
-
-            def _sig(facts: List[Dict[str, Any]]):
-                return sorted(
-                    (str(f.get("type", "")), str(f.get("subject", "")), str(f.get("value", "")))
-                    for f in facts
-                )
-
-            if _sig(existing_facts) == _sig(new_facts):
+            if not (counts["updated"] or counts["added"] or counts["removed"]):
                 self._log(
-                    f"No changes to facts ({len(existing_facts)} facts unchanged) - skipping store",
+                    f"No changes to facts ({len(existing_facts)} facts unchanged)",
                     "info",
                 )
                 return
-
             self._log(
-                f"Facts changed: {len(existing_facts)} -> {len(new_facts)} - storing",
+                f"Memory updated for user {user_id[:8]}: "
+                f"{counts['updated']} updated, {counts['added']} added, {counts['removed']} removed "
+                f"({len(existing_facts)} stored before)",
                 "info",
             )
-            stored = await asyncio.wait_for(self._save_facts(user_id, new_facts), timeout=30.0)
-            self._log(f"Memory updated for user {user_id[:8]}: {stored} facts stored", "info")
 
         except asyncio.TimeoutError:
             self._log("Memory update timed out after 30 seconds", "warning")
