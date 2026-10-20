@@ -1,12 +1,12 @@
 """
 title: User Memory
 author: beaudamore
-date: 2026-01-10
-version: 6.0
+date: 2026-10-20
+version: 6.1
 license: MIT
-description: Per-user fact memory. Inlet injects the relevant facts into the latest user message; outlet extracts new facts in the background. One PostgreSQL table, one row per fact, no LangGraph.
+description: Per-user fact memory. Inlet injects the relevant facts into the latest user message; outlet extracts new facts in the background. One PostgreSQL table, one row per fact, no LangGraph. PII scrub by the built-in regexes or by a local PII-Tracer model (valve pii_engine).
 required_open_webui_version: >= 0.11.0
-requirements: psycopg[binary]
+requirements: psycopg[binary], aiohttp
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from urllib.parse import quote_plus
 from pydantic import BaseModel, Field
 from fastapi import Request
 
+import aiohttp
 import psycopg
 
 # Open WebUI imports
@@ -174,6 +175,22 @@ PII_SUBJECT_BLOCKLIST = {
     "license number",
     "ip address",
 }
+
+# PII-Tracer engine (pii_engine = "pii_tracer"): the nine labels the model emits.
+PII_TRACER_LABELS = [
+    "private_person",
+    "private_email",
+    "private_phone",
+    "private_address",
+    "private_url",
+    "private_date",
+    "account_number",
+    "secret",
+    "other_pii",
+]
+# Default labels for the memory path: names and dates are left out so identity facts
+# ("name = Beau", a birthday) stay storable, as with the regex engine, which never matched names.
+PII_TRACER_MEMORY_LABELS = [l for l in PII_TRACER_LABELS if l not in ("private_person", "private_date")]
 
 
 
@@ -436,6 +453,25 @@ class Filter:
             ],
             description="Which PII pattern types to detect. Remove items to allow them through. Options: ssn, credit_card, phone, email, street_address, passport, drivers_license, bank_account, dob, ip_address",
         )
+        pii_engine: Literal["regex", "pii_tracer"] = Field(
+            default="regex",
+            description="What finds the PII for the pre-scrub and the fact check. 'regex': the built-in patterns (pii_patterns_enabled). 'pii_tracer': Perplexity's PII-Tracer model on a local server (pii_tracer_url, pii_tracer_labels); it reads context, so it also catches values the patterns cannot describe.",
+        )
+        pii_tracer_url: str = Field(
+            default="http://10.5.10.100:8193",
+            description="PII-Tracer server base URL (local-llm-config/pii-tracer, llmctl 'pii'). Used only when pii_engine is 'pii_tracer'.",
+        )
+        pii_tracer_timeout: float = Field(
+            default=15.0, description="Per-request timeout to the PII-Tracer server, seconds."
+        )
+        pii_tracer_labels: List[str] = Field(
+            default=list(PII_TRACER_MEMORY_LABELS),
+            description="PII-Tracer labels treated as PII on the memory path. Default leaves out private_person and private_date so names and birthdays can still be stored as identity facts. Options: " + ", ".join(PII_TRACER_LABELS),
+        )
+        pii_tracer_fallback: Literal["regex", "allow"] = Field(
+            default="regex",
+            description="When the PII-Tracer server is down or times out: 'regex' = use the built-in patterns for this update, 'allow' = treat the text as clean.",
+        )
 
         # Relevance Filtering
         relevance_filter_enabled: bool = Field(
@@ -477,6 +513,8 @@ class Filter:
         # Keep references to background extraction tasks so they are not
         # garbage-collected before they finish.
         self._bg_tasks: set = set()
+        # Set at the start of each memory update; the PII-Tracer failure is logged once per update.
+        self._pii_down_logged = False
 
     def _log(self, message: str, level: str = "info"):
         """Centralized logging"""
@@ -782,6 +820,112 @@ class Filter:
             self._log(f"Extraction traceback: {traceback.format_exc()}", "debug")
             return None
 
+    # ------------------------------------------------------------------
+    # PII engine: the built-in regexes or the PII-Tracer model (valve pii_engine)
+    # ------------------------------------------------------------------
+
+    def _pii_use_model(self) -> bool:
+        return self.valves.pii_engine == "pii_tracer"
+
+    def _pii_fallback(self, err: BaseException) -> bool:
+        """Log a PII-Tracer failure once per memory update. True when the regexes should take over."""
+        if not self._pii_down_logged:
+            self._pii_down_logged = True
+            self._log(
+                f"PII-Tracer unavailable at {self.valves.pii_tracer_url} ({type(err).__name__}: {err}); "
+                f"fallback={self.valves.pii_tracer_fallback}",
+                "warning",
+            )
+        return self.valves.pii_tracer_fallback == "regex"
+
+    async def _pii_tracer_spans(self, text: str) -> List[Dict[str, Any]]:
+        """Spans {label, start, end, score} from the PII-Tracer server, limited to pii_tracer_labels. Raises on failure."""
+        if not text or not text.strip():
+            return []
+        url = self.valves.pii_tracer_url.rstrip("/") + "/v1/pii/detect"
+        timeout = aiohttp.ClientTimeout(total=self.valves.pii_tracer_timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json={"text": text, "mask": False}) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                data = await resp.json()
+        wanted = set(self.valves.pii_tracer_labels)
+        return [s for s in data.get("spans", []) if s.get("label") in wanted]
+
+    async def _pii_detect(self, text: str) -> List[Dict[str, str]]:
+        """Findings [{label, match}] in text with the configured engine. For the model engine `match` is kept
+        out of log lines by the callers; the regex engine's callers log it as before."""
+        if not self._pii_use_model():
+            return [{"label": p["label"], "match": p["match"]} for p in detect_pii(text)]
+        try:
+            spans = await self._pii_tracer_spans(text)
+        except Exception as e:  # connection, timeout, bad status, bad JSON
+            if self._pii_fallback(e):
+                return [{"label": p["label"], "match": p["match"]} for p in detect_pii(text)]
+            return []
+        return [{"label": str(s["label"]), "match": text[int(s["start"]):int(s["end"])]} for s in spans]
+
+    async def _pii_scrub(self, text: str) -> str:
+        """text with every PII finding replaced by [REDACTED], with the configured engine."""
+        if not self._pii_use_model():
+            return scrub_pii(text, replacement="[REDACTED]", patterns=self.valves.pii_patterns_enabled)
+        try:
+            spans = await self._pii_tracer_spans(text)
+        except Exception as e:
+            if self._pii_fallback(e):
+                return scrub_pii(text, replacement="[REDACTED]", patterns=self.valves.pii_patterns_enabled)
+            return text
+        for s in sorted(spans, key=lambda s: -int(s["start"])):
+            text = text[: int(s["start"])] + "[REDACTED]" + text[int(s["end"]) :]
+        return text
+
+    async def _validate_fact(self, fact: Dict[str, Any]) -> Dict[str, Any]:
+        """validate_fact_no_pii with the configured engine (same return shape)."""
+        if not self._pii_use_model():
+            return validate_fact_no_pii(fact)
+        reasons: List[str] = []
+        subject = str(fact.get("subject", "") or "")
+        value = str(fact.get("value", "") or "")
+        if subject.lower().strip() in PII_SUBJECT_BLOCKLIST:
+            reasons.append(f"Blocked subject: '{subject}'")
+        # The model engine's reasons name the label only, never the matched text.
+        reasons.extend(f"{h['label']} detected in value" for h in await self._pii_detect(value))
+        reasons.extend(f"{h['label']} detected in subject" for h in await self._pii_detect(subject))
+        if not reasons:
+            return {"clean": True, "blocked_reasons": [], "scrubbed_fact": fact}
+        return {
+            "clean": False,
+            "blocked_reasons": reasons,
+            "scrubbed_fact": {
+                **fact,
+                "value": await self._pii_scrub(value),
+                "subject": await self._pii_scrub(subject),
+            },
+        }
+
+    async def _filter_facts_pii(self, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """filter_facts_pii with the configured engine: drop or redact facts with PII (pii_filter_mode)."""
+        if not self._pii_use_model():
+            return filter_facts_pii(
+                facts,
+                mode=self.valves.pii_filter_mode,
+                logger_fn=lambda msg: self._log(f"PII filter: {msg}", "warning"),
+            )
+        cleaned: List[Dict[str, Any]] = []
+        for fact in facts:
+            result = await self._validate_fact(fact)
+            if result["clean"]:
+                cleaned.append(fact)
+                continue
+            self._log(
+                f"PII filter: PII blocked in fact ({fact.get('type')}/{fact.get('subject')}): "
+                f"{', '.join(result['blocked_reasons'])}",
+                "warning",
+            )
+            if self.valves.pii_filter_mode == "redact":
+                cleaned.append(result["scrubbed_fact"])
+        return cleaned
+
     async def _update_user_memory_state(
         self,
         user_id: str,
@@ -798,6 +942,7 @@ class Filter:
         """
         try:
             self._log(f"Starting memory update for user {user_id[:8]}...", "info")
+            self._pii_down_logged = False
             existing_facts = await self._get_facts(user_id)
 
             def _for_prompt(f: Dict[str, Any]) -> Dict[str, Any]:
@@ -806,18 +951,17 @@ class Filter:
                     out["sentiment"] = f["sentiment"]
                 return out
 
-            def _scrub(msg: Dict[str, str]) -> Dict[str, str]:
+            async def _scrub(msg: Dict[str, str]) -> Dict[str, str]:
                 text = content_to_text(msg.get("content", ""))
                 if self.valves.pii_filter_enabled and self.valves.pii_scrub_input:
-                    scrubbed = scrub_pii(
-                        text,
-                        replacement="[REDACTED]",
-                        patterns=self.valves.pii_patterns_enabled,
-                    )
+                    scrubbed = await self._pii_scrub(text)
                     if scrubbed != text:
-                        self._log("PII pre-scrub: redacted PII in message", "info")
+                        self._log(f"PII pre-scrub ({self.valves.pii_engine}): redacted PII in message", "info")
                     text = scrubbed
                 return {"role": msg.get("role", "user"), "content": text}
+
+            earlier_scrubbed = [await _scrub(m) for m in earlier_messages]
+            new_scrubbed = await _scrub(new_message)
 
             # Local date of the server (honours the container's TZ), so "this year"
             # and "last month" resolve the way the user means them.
@@ -827,10 +971,10 @@ EXISTING FACTS:
 {json.dumps([_for_prompt(f) for f in existing_facts], indent=2)}
 
 EARLIER MESSAGES (context only, already processed):
-{json.dumps([_scrub(m) for m in earlier_messages], indent=2)}
+{json.dumps(earlier_scrubbed, indent=2)}
 
 NEW MESSAGE:
-{json.dumps(_scrub(new_message), indent=2)}"""
+{json.dumps(new_scrubbed, indent=2)}"""
 
             merged_json = await self._call_extraction_model(
                 merge_prompt, user=user, request=request
@@ -868,11 +1012,7 @@ NEW MESSAGE:
 
             if self.valves.pii_filter_enabled and changes:
                 pre_count = len(changes)
-                changes = filter_facts_pii(
-                    changes,
-                    mode=self.valves.pii_filter_mode,
-                    logger_fn=lambda msg: self._log(f"PII filter: {msg}", "warning"),
-                )
+                changes = await self._filter_facts_pii(changes)
                 if pre_count - len(changes) > 0:
                     self._log(
                         f"PII post-validation: blocked {pre_count - len(changes)} fact(s) containing PII",

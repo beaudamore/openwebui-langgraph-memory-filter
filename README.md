@@ -124,7 +124,12 @@ see "How it works" below for what is fixed behaviour.
 | `pii_filter_enabled` | `true` | Enable PII detection and filtering |
 | `pii_filter_mode` | `"remove"` | `remove` drops facts with PII; `redact` stores with `[REDACTED]` |
 | `pii_scrub_input` | `true` | Scrub PII from messages before sending to extraction model |
-| `pii_patterns_enabled` | all 10 | Which PII types to detect (see PII Protection section) |
+| `pii_patterns_enabled` | all 10 | Which PII types the **regex** engine detects (see PII Protection section) |
+| `pii_engine` | `"regex"` | What finds the PII: `regex` (built-in patterns) or `pii_tracer` (Perplexity's PII-Tracer model on a local server). Added 2026-10-20, v6.1 |
+| `pii_tracer_url` | `http://10.5.10.100:8193` | PII-Tracer server; only used with `pii_engine = pii_tracer` |
+| `pii_tracer_timeout` | `15` | Seconds per server call |
+| `pii_tracer_labels` | 7 of 9 | Model labels treated as PII on the memory path. `private_person` and `private_date` are left out by default so names and birthdays stay storable as identity facts |
+| `pii_tracer_fallback` | `"regex"` | Server down or timing out: `regex` uses the patterns for that update, `allow` treats the text as clean |
 | `debug_mode` | `false` | Debug log lines |
 
 Per-user valves: `enabled`, `show_status`.
@@ -189,6 +194,17 @@ docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c \
    WHERE user_id = '<user id>' AND type = 'identity' AND subject = 'age';"
 ```
 
+### PII engine offline test (v6.1)
+`tests/test_pii_engine.py` fakes the PII-Tracer server, the extraction model and the database and checks both engines, the
+label defaults (names kept), remove/redact, both fallbacks, and one whole background update. Run it inside the Open WebUI
+container (it has psycopg, aiohttp and open_webui):
+
+```
+docker cp filter/user_memory_filter.py open-webui:/tmp/ && docker cp tests/test_pii_engine.py open-webui:/tmp/
+docker exec -e PYTHONPATH=/app/backend open-webui python /tmp/test_pii_engine.py /tmp/user_memory_filter.py   # ends with ALL PII ENGINE TESTS PASSED
+# (importing the filter imports open_webui, whose startup logging appears first; the read-only static-file errors are harmless)
+```
+
 ### Watch it work
 
 ```bash
@@ -202,13 +218,21 @@ The filter includes a **3-layer defense-in-depth** system to prevent storage of 
 ### Layer 1: Prompt Guardrails
 The extraction model's system prompt explicitly instructs it to never extract PII. Examples are provided showing how to extract non-PII meaning from PII-containing messages (e.g., "I bought a house at 123 Oak Lane" → store `ownership: house, recently purchased a house`).
 
-### Layer 2: Regex Pre-Scrub
+### Layer 2: Pre-Scrub
 Before messages reach the extraction model, all PII is replaced with `[REDACTED]`. The LLM never sees raw PII data.
+What counts as PII is decided by the engine chosen with `pii_engine` (below).
 
 ### Layer 3: Post-Extraction Validation
-Every extracted fact is scanned for PII in both `subject` and `value` fields, plus a subject blocklist. Facts with PII are either dropped or redacted based on config.
+Every extracted fact is scanned for PII in both `subject` and `value` fields, plus a subject blocklist. Facts with PII are either dropped or redacted based on config. Same engine as layer 2.
 
-### Detected PII Types
+### The two engines (`pii_engine`, since v6.1, 2026-10-20)
+
+- **`regex`** (default): the ten built-in patterns in the table below, selectable with `pii_patterns_enabled`. No network, no model, no names: a pattern cannot tell a person's name from any other words, so names were never matched and identity facts survive.
+- **`pii_tracer`**: [PII-Tracer](https://huggingface.co/perplexity-ai/PII-Tracer), Perplexity's 0.6B PII detector, running as a local server (on this Mac: `local-llm-config/pii-tracer`, `llmctl start pii`, port 8193; the companion `openwebui-pii-tracer-filter` uses the same server for the chat path). It reads context, so it also finds account numbers, secrets, addresses and other values that have no fixed shape. Each pre-scrubbed message and each extracted fact's subject and value is one call to `POST /v1/pii/detect`; findings whose label is in `pii_tracer_labels` are redacted. By default `private_person` and `private_date` are **not** in that list, so "name = Beau" or a birthday is still stored, as with the regex engine; add them for a memory that keeps no names at all. With the model engine the log names the label of a blocked fact, never the matched text (the regex engine's log lines are unchanged and still quote the match). If the server cannot be reached, `pii_tracer_fallback` decides: `regex` (default) runs the patterns for that update and logs the failure once, `allow` treats the text as clean.
+
+Switching engines does not touch stored facts; it only changes what the next updates scrub and block.
+
+### Detected PII Types (regex engine)
 
 | Pattern | Example |
 |---------|---------|

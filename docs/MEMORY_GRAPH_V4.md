@@ -76,7 +76,7 @@ The LangGraph checkpointer (thread id = user id) now stores only metadata:
    - The result is formatted by `_format_memory_context` and prepended to the system message.
 3. **Upsert** (`_update_user_memory_state`), when the number of user messages reaches `extraction_threshold`:
    - The last 10 messages are reduced to user-role messages only. System and assistant turns never reach the manager.
-   - PII pre-scrub (`scrub_pii`) if enabled.
+   - PII pre-scrub if enabled (`scrub_pii` regexes, or the PII-Tracer server when `pii_engine = pii_tracer`, v6.1).
    - The joined user text is embedded; candidates = all always-inject facts plus the `retrieval_top_k` nearest others, each with its id.
    - The manager receives `CANDIDATE FACTS` and `NEW CONVERSATION` and returns `{"ops": [...]}`.
    - `_validate_ops` checks each op (see below). Facts being written are embedded in one batch.
@@ -127,6 +127,7 @@ Rejected ops are dropped individually. The rest still apply.
 | `always_inject_types` | `["identity"]` | Bypass retrieval, always candidates, always injected |
 | `max_injected_memories`, `memory_injection_format` | 10, `structured` | Unchanged from 2.x |
 | `pii_filter_enabled`, `pii_filter_mode`, `pii_scrub_input`, `pii_patterns_enabled` | true, remove, true, all ten patterns | Unchanged from 2.x |
+| `pii_engine`, `pii_tracer_url`, `pii_tracer_timeout`, `pii_tracer_labels`, `pii_tracer_fallback` | regex, http://10.5.10.100:8193, 15, 7 of 9 labels, regex | v6.1 (2026-10-20): regex or the local PII-Tracer model; see README "The two engines" |
 | `show_status`, `show_injected_memories`, `debug_mode`, `priority` | true, false, false, 10 | Unchanged from 2.x |
 
 Changing a valve takes effect on the next request. Changing the code in the
