@@ -1,10 +1,10 @@
 """
 title: User Memory
 author: beaudamore
-date: 2026-10-20
-version: 6.1
+date: 2026-10-24
+version: 7.1
 license: MIT
-description: Per-user fact memory. Inlet injects the relevant facts into the latest user message; outlet extracts new facts in the background. One PostgreSQL table, one row per fact, no LangGraph. PII scrub by the built-in regexes or by a local PII-Tracer model (valve pii_engine).
+description: Per-user fact memory on PostgreSQL + pgvector. Inlet embeds the recent chat and injects the nearest facts into the latest user message (no relevance model); outlet extracts fact changes in the background with the memory-manager model and de-duplicates by vector similarity. Embeddings come from Open WebUI's own configured embedding model and are rebuilt automatically when that model changes. PII: none, built-in regexes, or a local PII-Tracer server (valve pii_engine).
 required_open_webui_version: >= 0.11.0
 requirements: psycopg[binary], aiohttp
 """
@@ -17,7 +17,7 @@ import asyncio
 import re
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse
 
 from pydantic import BaseModel, Field
 from fastapi import Request
@@ -29,11 +29,16 @@ import psycopg
 from open_webui.models.users import Users
 from open_webui.utils.chat import generate_chat_completion
 
+try:  # the prefixes Open WebUI itself sends to the embedding model (None unless set by env)
+    from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX, RAG_EMBEDDING_CONTENT_PREFIX
+except Exception:  # pragma: no cover
+    RAG_EMBEDDING_QUERY_PREFIX = RAG_EMBEDDING_CONTENT_PREFIX = None
+
 logger = logging.getLogger("openwebui.filters.user_memory")
 logger.setLevel(logging.INFO)
 
 # A fact is a dict: {type, subject, value, sentiment, confidence, first_mentioned, last_updated},
-# one row per fact in table user_facts. Types the extraction prompt uses: identity, status,
+# one row per fact in table user_facts, plus an `embedding` vector of "subject: value". Types the extraction prompt uses: identity, status,
 # preference, ownership, relationship, goal, skill, event. Any type string is accepted and
 # rendered. Facts are unique per user on lower-cased (type, subject), which is how they are
 # stored; see _fact_key.
@@ -398,12 +403,11 @@ class Filter:
             description="Filter execution priority. Lower numbers run first. Safety filters (antivirus, content policy, prompt injection, llamaguard) should run BEFORE memory (e.g., -100 to -10), so set this to positive (10-50) to run after safety checks pass.",
         )
 
-        # PostgreSQL Configuration
-        postgres_host: str = Field(
-            default="langgraph-postgres",
-            description="PostgreSQL host (docker service name or IP)",
+        # PostgreSQL address. Independent of how the database is deployed.
+        postgres_url: str = Field(
+            default="",
+            description="URL of the PostgreSQL server: scheme://host or scheme://host:port (port defaults to 5432). The scheme is http, https or postgresql. Examples: http://langgraph-pgvector, http://10.5.10.100:5432, https://db.example.org:5435. Required. The server needs the pgvector extension (image pgvector/pgvector).",
         )
-        postgres_port: int = Field(default=5432, description="PostgreSQL port")
         postgres_database: str = Field(
             default="langgraph_memory", description="PostgreSQL database name"
         )
@@ -425,10 +429,11 @@ class Filter:
         show_status: bool = Field(
             default=True, description="Show memory processing status messages"
         )
+
         # PII Protection
-        pii_filter_enabled: bool = Field(
-            default=True,
-            description="Enable PII detection and filtering. When enabled, phone numbers, SSNs, addresses, credit cards, and other PII are blocked from memory storage.",
+        pii_engine: Literal["none", "regex", "pii_tracer"] = Field(
+            default="regex",
+            description="What finds PII before a fact is stored. 'none': nothing is checked or scrubbed, facts are stored exactly as extracted. 'regex': the built-in patterns (pii_patterns_enabled). 'pii_tracer': Perplexity's PII-Tracer model on a local server (pii_tracer_url, pii_tracer_labels); it reads context, so it also catches values the patterns cannot describe.",
         )
         pii_filter_mode: Literal["remove", "redact"] = Field(
             default="remove",
@@ -436,7 +441,7 @@ class Filter:
         )
         pii_scrub_input: bool = Field(
             default=True,
-            description="Scrub PII from messages BEFORE sending to extraction model. Prevents PII from even reaching the LLM.",
+            description="Scrub PII from messages BEFORE sending to extraction model. Prevents PII from even reaching the LLM. Ignored when pii_engine is 'none'.",
         )
         pii_patterns_enabled: List[str] = Field(
             default=[
@@ -451,15 +456,11 @@ class Filter:
                 "dob",
                 "ip_address",
             ],
-            description="Which PII pattern types to detect. Remove items to allow them through. Options: ssn, credit_card, phone, email, street_address, passport, drivers_license, bank_account, dob, ip_address",
-        )
-        pii_engine: Literal["regex", "pii_tracer"] = Field(
-            default="regex",
-            description="What finds the PII for the pre-scrub and the fact check. 'regex': the built-in patterns (pii_patterns_enabled). 'pii_tracer': Perplexity's PII-Tracer model on a local server (pii_tracer_url, pii_tracer_labels); it reads context, so it also catches values the patterns cannot describe.",
+            description="Which PII pattern types to detect (regex engine, and the regex fallback of the pii_tracer engine). Remove items to allow them through. Options: ssn, credit_card, phone, email, street_address, passport, drivers_license, bank_account, dob, ip_address",
         )
         pii_tracer_url: str = Field(
-            default="http://10.5.10.100:8193",
-            description="PII-Tracer server base URL (local-llm-config/pii-tracer, llmctl 'pii'). Used only when pii_engine is 'pii_tracer'.",
+            default="",
+            description="PII-Tracer server base URL, e.g. http://pii-tracer:8193 or http://10.5.10.100:8193. Required when pii_engine is 'pii_tracer'; unused otherwise.",
         )
         pii_tracer_timeout: float = Field(
             default=15.0, description="Per-request timeout to the PII-Tracer server, seconds."
@@ -470,21 +471,29 @@ class Filter:
         )
         pii_tracer_fallback: Literal["regex", "allow"] = Field(
             default="regex",
-            description="When the PII-Tracer server is down or times out: 'regex' = use the built-in patterns for this update, 'allow' = treat the text as clean.",
+            description="When the PII-Tracer server is down, unset or times out: 'regex' = use the built-in patterns for this update, 'allow' = treat the text as clean.",
         )
 
-        # Relevance Filtering
-        relevance_filter_enabled: bool = Field(
-            default=True,
-            description="When enabled, only memories relevant to the current conversation are injected instead of all stored facts. Requires a separate relevance model.",
+        # Retrieval (vector search; no relevance model)
+        query_window_messages: int = Field(
+            default=6,
+            description="How many of the most recent chat messages (user and assistant turns) are embedded as the search text for memory retrieval. 1 = only the latest user message. Larger windows keep the topic across turns; smaller ones react faster to a topic change.",
         )
-        relevance_model_id: str = Field(
-            default="memory-relevance",
-            description="Open WebUI model id for relevance selection. Create a workspace model with prompt/RELEVANCE_PROMPT.md as its system prompt.",
+        relevance_threshold: float = Field(
+            default=0.45,
+            description="Minimum cosine similarity (0 to 1) between the search text and a stored fact ('subject: value') for the fact to be a candidate. 0 disables the cutoff so the reranker/max_memories alone decide. The scale depends on the embedding model: measured with bge-m3 on short facts, unrelated facts score 0.40-0.50 and on-topic ones 0.50-0.65, so cosine alone separates weakly and a reranker (Open WebUI Documents > Reranking) does the real ordering. Lower it if memories are missed, raise it if unrelated facts show up. Facts in always_inject_types ignore it.",
+        )
+        max_memories: int = Field(
+            default=20,
+            description="Maximum number of facts injected per turn, not counting always_inject_types: the top N after the similarity cutoff, ordered by Open WebUI's reranker when one is configured (Admin Panel > Documents > Reranking), by vector similarity otherwise. Also the number of nearest existing facts the extraction model sees as context. 0 = no cap.",
         )
         always_inject_types: List[str] = Field(
             default=["identity"],
-            description="Fact types that ALWAYS get injected regardless of relevance filtering. Identity facts (name, job, location) are usually always useful.",
+            description="Fact types that are ALWAYS injected regardless of similarity. Identity facts (name, job, location) are usually always useful.",
+        )
+        dedupe_threshold: float = Field(
+            default=0.9,
+            description="Cosine similarity (0 to 1) above which a newly extracted fact is treated as the same fact as an existing one of the same type with a different subject wording (e.g. 'job' vs 'occupation'): the existing row is updated instead of a second row being added. 1 disables the merge. Keep it high; 0.85-0.95 is the useful range.",
         )
 
         # Debug
@@ -559,7 +568,77 @@ class Filter:
             return None
 
     # ------------------------------------------------------------------
-    # Storage: one row per fact in table user_facts
+    # Embeddings: Open WebUI's own configured embedding model
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _fact_text(fact: Dict[str, Any]) -> str:
+        """The text that is embedded for a fact. Type is not included: it is a
+        category word and is already matched in SQL."""
+        return f"{str(fact.get('subject', '')).strip()}: {str(fact.get('value', '')).strip()}"
+
+    async def _embedding_model_name(self, request: Any) -> str:
+        """engine/model as Open WebUI has it configured, for change detection.
+        Open WebUI >= 0.12 keeps it in the config table (keys rag.embedding_engine,
+        rag.embedding_model); older versions on request.app.state.config."""
+        engine = model = None
+        try:
+            from open_webui.models.config import Config  # 0.12+
+            cfg = await Config.get_many("rag.embedding_engine", "rag.embedding_model")
+            engine, model = cfg.get("rag.embedding_engine"), cfg.get("rag.embedding_model")
+        except Exception as e:
+            self._log(f"Config table not readable ({type(e).__name__}); using app.state.config", "debug")
+        if not model:
+            cfg = getattr(getattr(getattr(request, "app", None), "state", None), "config", None)
+            engine = getattr(cfg, "RAG_EMBEDDING_ENGINE", engine)
+            model = getattr(cfg, "RAG_EMBEDDING_MODEL", None)
+        return f"{engine or 'local'}/{model or 'unknown'}"
+
+    async def _embed(
+        self, texts: List[str], request: Any, user: Any, prefix: Optional[str]
+    ) -> List[List[float]]:
+        """Embed texts with request.app.state.EMBEDDING_FUNCTION (list in, list of vectors out)."""
+        fn = getattr(getattr(getattr(request, "app", None), "state", None), "EMBEDDING_FUNCTION", None)
+        if fn is None:
+            raise RuntimeError(
+                "Open WebUI has no embedding function configured (Admin Panel > Settings > Documents > Embedding)."
+            )
+        result = fn(texts, prefix=prefix, user=user)
+        if asyncio.iscoroutine(result):
+            result = await result
+        if not isinstance(result, list) or len(result) != len(texts):
+            raise RuntimeError(f"Embedding function returned {type(result).__name__} for {len(texts)} texts")
+        return [list(map(float, v)) for v in result]
+
+    @staticmethod
+    def _vec(v: List[float]) -> str:
+        """pgvector input literal."""
+        return "[" + ",".join(repr(x) for x in v) + "]"
+
+    async def _rerank(
+        self, query_text: str, facts: List[Dict[str, Any]], request: Any, user: Any
+    ) -> Optional[List[float]]:
+        """Scores from request.app.state.RERANKING_FUNCTION (Open WebUI's configured
+        reranker), one per fact, or None when no reranker is configured."""
+        fn = getattr(getattr(getattr(request, "app", None), "state", None), "RERANKING_FUNCTION", None)
+        if fn is None or len(facts) < 2:
+            return None
+
+        class _Doc:  # the reranker reads .page_content
+            __slots__ = ("page_content",)
+
+            def __init__(self, text: str):
+                self.page_content = text
+
+        docs = [_Doc(self._fact_text(f)) for f in facts]
+        result = await asyncio.to_thread(fn, query_text, docs, user=user)
+        if asyncio.iscoroutine(result):
+            result = await result
+        if not isinstance(result, list) or len(result) != len(facts):
+            raise RuntimeError(f"Reranker returned {type(result).__name__} for {len(facts)} facts")
+        return [float(x) for x in result]
+
+    # ------------------------------------------------------------------
+    # Storage: one row per fact in table user_facts (+ embedding), meta in user_facts_meta
     # ------------------------------------------------------------------
     async def _connect(self) -> psycopg.AsyncConnection:
         """One plain connection per query. No pool: psycopg ships with Open WebUI,
@@ -569,26 +648,33 @@ class Filter:
             self._conninfo, autocommit=True, connect_timeout=15
         )
 
-    async def _init_store(self):
-        """Check the connection and create the table on first use."""
+    async def _init_store(self, request: Any, user: Any):
+        """First use: check the connection, create extension/tables, and make sure
+        every row's embedding matches Open WebUI's current embedding model."""
         if self._conninfo is not None:
             return
         async with self._init_lock:
             if self._conninfo is not None:
                 return
+            url = urlparse(self.valves.postgres_url.strip())
+            if url.scheme not in ("http", "https", "postgresql", "postgres") or not url.hostname:
+                raise ConnectionError(
+                    "Valve postgres_url must be scheme://host or scheme://host:port, "
+                    "e.g. http://langgraph-pgvector or http://10.5.10.100:5432."
+                )
+            host, port = url.hostname, url.port or 5432
             conninfo = (
                 f"postgresql://{self.valves.postgres_user}:"
                 f"{quote_plus(self.valves.postgres_password)}@"
-                f"{self.valves.postgres_host}:{self.valves.postgres_port}/"
+                f"{host}:{port}/"
                 f"{self.valves.postgres_database}"
             )
-            self._log(
-                f"Connecting to PostgreSQL at {self.valves.postgres_host}:{self.valves.postgres_port}"
-            )
+            self._log(f"Connecting to PostgreSQL at {host}:{port}")
             try:
                 async with await psycopg.AsyncConnection.connect(
                     conninfo, autocommit=True, connect_timeout=15
                 ) as conn:
+                    await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
                     await conn.execute(
                         """
                         CREATE TABLE IF NOT EXISTS user_facts (
@@ -604,96 +690,252 @@ class Filter:
                         )
                         """
                     )
+                    await conn.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS user_facts_meta (
+                            id              INT         PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+                            embedding_model TEXT        NOT NULL,
+                            embedding_dim   INT         NOT NULL,
+                            updated         TIMESTAMPTZ NOT NULL DEFAULT now()
+                        )
+                        """
+                    )
+                    await self._sync_embeddings(conn, request, user)
                 self._conninfo = conninfo
-                self._log("User memory store ready (table user_facts)", "info")
+                self._log("User memory store ready (table user_facts, pgvector)", "info")
             except Exception as e:
                 self._log(f"Failed to open the memory store: {e}", "error")
                 raise ConnectionError(
-                    f"Cannot connect to PostgreSQL at {self.valves.postgres_host}:{self.valves.postgres_port}: {e}"
+                    f"Cannot open the memory store at {host}:{port}: {e}"
                 )
 
-    async def _get_facts(self, user_id: str) -> List[Dict[str, Any]]:
+    async def _sync_embeddings(self, conn: psycopg.AsyncConnection, request: Any, user: Any):
+        """Rebuild the embedding column and every row's vector when Open WebUI's
+        embedding model or its dimension differs from what the table was built with."""
+        model = await self._embedding_model_name(request)
+        dim = len((await self._embed(["dimension probe"], request, user, RAG_EMBEDDING_CONTENT_PREFIX))[0])
+
+        cur = await conn.execute("SELECT embedding_model, embedding_dim FROM user_facts_meta WHERE id = 1")
+        meta = await cur.fetchone()
+        cur = await conn.execute(
+            "SELECT atttypmod FROM pg_attribute WHERE attrelid = 'user_facts'::regclass "
+            "AND attname = 'embedding' AND NOT attisdropped"
+        )
+        col = await cur.fetchone()
+        col_dim = col[0] if col else None
+
+        if meta and meta[0] == model and meta[1] == dim and col_dim == dim:
+            return
+        self._log(
+            f"Embedding change: stored={meta[0] if meta else None}/{meta[1] if meta else None} "
+            f"column={col_dim} current={model}/{dim}. Rebuilding every fact embedding.",
+            "warning",
+        )
+        async with conn.transaction():
+            await conn.execute("DROP INDEX IF EXISTS user_facts_embedding_idx")
+            await conn.execute("ALTER TABLE user_facts DROP COLUMN IF EXISTS embedding")
+            await conn.execute(f"ALTER TABLE user_facts ADD COLUMN embedding vector({dim})")
+            cur = await conn.execute("SELECT user_id, type, subject, value FROM user_facts ORDER BY user_id, type, subject")
+            rows = await cur.fetchall()
+            batch = 64
+            for i in range(0, len(rows), batch):
+                chunk = rows[i : i + batch]
+                vectors = await self._embed(
+                    [self._fact_text({"subject": r[2], "value": r[3]}) for r in chunk],
+                    request, user, RAG_EMBEDDING_CONTENT_PREFIX,
+                )
+                for r, v in zip(chunk, vectors):
+                    await conn.execute(
+                        "UPDATE user_facts SET embedding = %s::vector WHERE user_id = %s AND type = %s AND subject = %s",
+                        (self._vec(v), r[0], r[1], r[2]),
+                    )
+            if dim <= 2000:  # hnsw on `vector` is limited to 2000 dims
+                await conn.execute(
+                    "CREATE INDEX user_facts_embedding_idx ON user_facts USING hnsw (embedding vector_cosine_ops)"
+                )
+            await conn.execute(
+                """
+                INSERT INTO user_facts_meta (id, embedding_model, embedding_dim, updated)
+                VALUES (1, %s, %s, now())
+                ON CONFLICT (id) DO UPDATE SET embedding_model = EXCLUDED.embedding_model,
+                    embedding_dim = EXCLUDED.embedding_dim, updated = now()
+                """,
+                (model, dim),
+            )
+        self._log(f"Re-embedded {len(rows)} fact(s) with {model} ({dim} dims)", "info")
+
+    @staticmethod
+    def _row_to_fact(row: tuple) -> Dict[str, Any]:
+        type_, subject, value, sentiment, confidence, first_mentioned, last_updated = row[:7]
+        fact = {
+            "type": type_,
+            "subject": subject,
+            "value": value,
+            "sentiment": sentiment,
+            "confidence": confidence,
+            "first_mentioned": first_mentioned.isoformat(),
+            "last_updated": last_updated.isoformat(),
+        }
+        if len(row) > 7:
+            fact["similarity"] = round(float(row[7]), 3)
+        return fact
+
+    _FACT_COLS = "type, subject, value, sentiment, confidence, first_mentioned, last_updated"
+
+    async def _get_all_facts(self, user_id: str) -> List[Dict[str, Any]]:
         """All stored facts for the user, oldest first (empty list when none)."""
-        await self._init_store()
         async with await self._connect() as conn:
             cur = await conn.execute(
-                """
-                SELECT type, subject, value, sentiment, confidence,
-                       first_mentioned, last_updated
-                FROM user_facts
-                WHERE user_id = %s
-                ORDER BY first_mentioned, type, subject
-                """,
+                f"SELECT {self._FACT_COLS} FROM user_facts WHERE user_id = %s ORDER BY first_mentioned, type, subject",
                 (user_id,),
             )
             rows = await cur.fetchall()
-        return [
-            {
-                "type": type_,
-                "subject": subject,
-                "value": value,
-                "sentiment": sentiment,
-                "confidence": confidence,
-                "first_mentioned": first_mentioned.isoformat(),
-                "last_updated": last_updated.isoformat(),
-            }
-            for type_, subject, value, sentiment, confidence, first_mentioned, last_updated in rows
-        ]
+        return [self._row_to_fact(r) for r in rows]
+
+    async def _search_facts(
+        self,
+        user_id: str,
+        query_text: str,
+        request: Any,
+        user: Any,
+        threshold: float,
+        limit: int,
+    ) -> List[Dict[str, Any]]:
+        """always_inject_types facts, plus the facts nearest to query_text:
+        cosine similarity >= threshold, ordered by Open WebUI's reranker when one is
+        configured (vector order otherwise), at most `limit` (0 = no cap)."""
+        always = list(self.valves.always_inject_types)
+        has_reranker = getattr(getattr(getattr(request, "app", None), "state", None), "RERANKING_FUNCTION", None) is not None
+        # With a reranker, give it more candidates than the final cap to choose from.
+        fetch = limit * 3 if (limit > 0 and has_reranker) else limit
+        async with await self._connect() as conn:
+            cur = await conn.execute(
+                f"SELECT {self._FACT_COLS} FROM user_facts WHERE user_id = %s AND type = ANY(%s) "
+                "ORDER BY first_mentioned, type, subject",
+                (user_id, always),
+            )
+            always_facts = [self._row_to_fact(r) for r in await cur.fetchall()]
+            if not query_text.strip():
+                return always_facts
+            qvec = self._vec((await self._embed([query_text], request, user, RAG_EMBEDDING_QUERY_PREFIX))[0])
+            sql = (
+                f"SELECT {self._FACT_COLS}, 1 - (embedding <=> %s::vector) AS similarity "
+                "FROM user_facts WHERE user_id = %s AND NOT (type = ANY(%s)) AND embedding IS NOT NULL "
+                "ORDER BY embedding <=> %s::vector"
+            )
+            params: List[Any] = [qvec, user_id, always, qvec]
+            if fetch > 0:
+                sql += " LIMIT %s"
+                params.append(fetch)
+            cur = await conn.execute(sql, params)
+            near = [self._row_to_fact(r) for r in await cur.fetchall()]
+        self._log(
+            "Vector search: " + ", ".join(f"{f['type']}/{f['subject']}={f['similarity']}" for f in near),
+            "debug",
+        )
+        kept = [f for f in near if f["similarity"] >= threshold]
+        scores = await self._rerank(query_text, kept, request, user) if has_reranker else None
+        if scores is not None:
+            for f, sc in zip(kept, scores):
+                f["rerank"] = round(sc, 3)
+            kept.sort(key=lambda f: f["rerank"], reverse=True)
+            self._log(
+                "Reranked: " + ", ".join(f"{f['type']}/{f['subject']}={f['rerank']}" for f in kept),
+                "debug",
+            )
+        if limit > 0:
+            kept = kept[:limit]
+        return always_facts + kept
 
     async def _apply_changes(
-        self, user_id: str, changes: List[Dict[str, Any]]
+        self, user_id: str, changes: List[Dict[str, Any]], request: Any, user: Any
     ) -> Dict[str, int]:
         """
         Apply the extraction model's change list, one row per fact, in one transaction.
 
         - Fact flagged removed (see _fact_marked_removed): DELETE by key.
-        - Otherwise INSERT, or UPDATE value/sentiment/confidence when any of them differs.
+        - Otherwise the fact is embedded ("subject: value"). If no row has this exact
+          (type, subject) but a row of the same type is at least dedupe_threshold
+          similar, the change is applied to that row instead (merged).
+        - INSERT, or UPDATE value/sentiment/confidence/embedding when any differs.
           An unchanged fact is not touched, so last_updated only moves when the fact did.
         - Facts the model did not mention are left alone.
-        Returns counts: updated, added, removed, skipped.
+        Returns counts: updated, added, removed, merged, skipped.
         """
-        await self._init_store()
-        counts = {"updated": 0, "added": 0, "removed": 0, "skipped": 0}
+        counts = {"updated": 0, "added": 0, "removed": 0, "merged": 0, "skipped": 0}
+        upserts: List[tuple] = []
+        removals: List[tuple] = []
+        for fact in changes:
+            type_, subject = _fact_key(fact)
+            if not type_ or not subject:
+                self._log(f"Skipping fact without type/subject: {fact}", "warning")
+                counts["skipped"] += 1
+                continue
+            if _fact_marked_removed(fact):
+                removals.append((type_, subject))
+                continue
+            value = str(fact.get("value") or "").strip()
+            if not value:
+                self._log(f"Skipping fact without value: {fact}", "warning")
+                counts["skipped"] += 1
+                continue
+            sentiment = str(fact.get("sentiment") or "").strip().lower() or None
+            try:
+                confidence = float(fact.get("confidence", 0.8))
+            except (TypeError, ValueError):
+                confidence = 0.8
+            upserts.append((type_, subject, value, sentiment, confidence))
+
+        vectors = (
+            await self._embed(
+                [self._fact_text({"subject": u[1], "value": u[2]}) for u in upserts],
+                request, user, RAG_EMBEDDING_CONTENT_PREFIX,
+            )
+            if upserts else []
+        )
+
         async with await self._connect() as conn:
             async with conn.transaction():
-                for fact in changes:
-                    type_, subject = _fact_key(fact)
-                    if not type_ or not subject:
-                        self._log(f"Skipping fact without type/subject: {fact}", "warning")
-                        counts["skipped"] += 1
-                        continue
-                    if _fact_marked_removed(fact):
+                for type_, subject in removals:
+                    cur = await conn.execute(
+                        "DELETE FROM user_facts WHERE user_id = %s AND type = %s AND subject = %s",
+                        (user_id, type_, subject),
+                    )
+                    counts["removed"] += cur.rowcount
+                for (type_, subject, value, sentiment, confidence), vec in zip(upserts, vectors):
+                    vlit = self._vec(vec)
+                    if self.valves.dedupe_threshold < 1:
                         cur = await conn.execute(
-                            "DELETE FROM user_facts WHERE user_id = %s AND type = %s AND subject = %s",
-                            (user_id, type_, subject),
+                            "SELECT subject, 1 - (embedding <=> %s::vector) AS similarity FROM user_facts "
+                            "WHERE user_id = %s AND type = %s AND subject <> %s AND embedding IS NOT NULL "
+                            "AND NOT EXISTS (SELECT 1 FROM user_facts e WHERE e.user_id = %s AND e.type = %s AND e.subject = %s) "
+                            "ORDER BY embedding <=> %s::vector LIMIT 1",
+                            (vlit, user_id, type_, subject, user_id, type_, subject, vlit),
                         )
-                        counts["removed"] += cur.rowcount
-                        continue
-                    value = str(fact.get("value") or "").strip()
-                    if not value:
-                        self._log(f"Skipping fact without value: {fact}", "warning")
-                        counts["skipped"] += 1
-                        continue
-                    sentiment = str(fact.get("sentiment") or "").strip().lower() or None
-                    try:
-                        confidence = float(fact.get("confidence", 0.8))
-                    except (TypeError, ValueError):
-                        confidence = 0.8
+                        near = await cur.fetchone()
+                        if near and float(near[1]) >= self.valves.dedupe_threshold:
+                            self._log(
+                                f"Merging {type_}/{subject} into existing {type_}/{near[0]} (similarity {float(near[1]):.3f})",
+                                "info",
+                            )
+                            subject = near[0]
+                            counts["merged"] += 1
                     cur = await conn.execute(
                         """
-                        INSERT INTO user_facts (user_id, type, subject, value, sentiment, confidence)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        INSERT INTO user_facts (user_id, type, subject, value, sentiment, confidence, embedding)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s::vector)
                         ON CONFLICT (user_id, type, subject) DO UPDATE
                             SET value        = EXCLUDED.value,
                                 sentiment    = EXCLUDED.sentiment,
                                 confidence   = EXCLUDED.confidence,
+                                embedding    = EXCLUDED.embedding,
                                 last_updated = now()
                             WHERE user_facts.value      IS DISTINCT FROM EXCLUDED.value
                                OR user_facts.sentiment  IS DISTINCT FROM EXCLUDED.sentiment
                                OR user_facts.confidence IS DISTINCT FROM EXCLUDED.confidence
                         RETURNING (xmax = 0) AS inserted
                         """,
-                        (user_id, type_, subject, value, sentiment, confidence),
+                        (user_id, type_, subject, value, sentiment, confidence, vlit),
                     )
                     row = await cur.fetchone()
                     if row is None:
@@ -701,7 +943,8 @@ class Filter:
                     counts["added" if row[0] else "updated"] += 1
         self._log(
             f"Applied changes for user {user_id[:8]}...: {counts['updated']} updated, "
-            f"{counts['added']} added, {counts['removed']} removed, {counts['skipped']} skipped",
+            f"{counts['added']} added, {counts['removed']} removed, {counts['merged']} merged, "
+            f"{counts['skipped']} skipped",
             "info",
         )
         return counts
@@ -824,6 +1067,9 @@ class Filter:
     # PII engine: the built-in regexes or the PII-Tracer model (valve pii_engine)
     # ------------------------------------------------------------------
 
+    def _pii_enabled(self) -> bool:
+        return self.valves.pii_engine != "none"
+
     def _pii_use_model(self) -> bool:
         return self.valves.pii_engine == "pii_tracer"
 
@@ -842,7 +1088,9 @@ class Filter:
         """Spans {label, start, end, score} from the PII-Tracer server, limited to pii_tracer_labels. Raises on failure."""
         if not text or not text.strip():
             return []
-        url = self.valves.pii_tracer_url.rstrip("/") + "/v1/pii/detect"
+        if not self.valves.pii_tracer_url.strip():
+            raise RuntimeError("valve pii_tracer_url is empty")
+        url = self.valves.pii_tracer_url.strip().rstrip("/") + "/v1/pii/detect"
         timeout = aiohttp.ClientTimeout(total=self.valves.pii_tracer_timeout)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, json={"text": text, "mask": False}) as resp:
@@ -943,17 +1191,11 @@ class Filter:
         try:
             self._log(f"Starting memory update for user {user_id[:8]}...", "info")
             self._pii_down_logged = False
-            existing_facts = await self._get_facts(user_id)
-
-            def _for_prompt(f: Dict[str, Any]) -> Dict[str, Any]:
-                out = {"type": f.get("type"), "subject": f.get("subject"), "value": f.get("value")}
-                if f.get("sentiment"):
-                    out["sentiment"] = f["sentiment"]
-                return out
+            await self._init_store(request, user)
 
             async def _scrub(msg: Dict[str, str]) -> Dict[str, str]:
                 text = content_to_text(msg.get("content", ""))
-                if self.valves.pii_filter_enabled and self.valves.pii_scrub_input:
+                if self._pii_enabled() and self.valves.pii_scrub_input:
                     scrubbed = await self._pii_scrub(text)
                     if scrubbed != text:
                         self._log(f"PII pre-scrub ({self.valves.pii_engine}): redacted PII in message", "info")
@@ -962,6 +1204,20 @@ class Filter:
 
             earlier_scrubbed = [await _scrub(m) for m in earlier_messages]
             new_scrubbed = await _scrub(new_message)
+
+            # Context for the extraction model: the always-inject facts plus the
+            # existing facts nearest to the new message (no similarity cutoff, so a
+            # fact being corrected is seen even when worded differently).
+            existing_facts = await self._search_facts(
+                user_id, new_scrubbed["content"], request, user,
+                threshold=0.0, limit=self.valves.max_memories,
+            )
+
+            def _for_prompt(f: Dict[str, Any]) -> Dict[str, Any]:
+                out = {"type": f.get("type"), "subject": f.get("subject"), "value": f.get("value")}
+                if f.get("sentiment"):
+                    out["sentiment"] = f["sentiment"]
+                return out
 
             # Local date of the server (honours the container's TZ), so "this year"
             # and "last month" resolve the way the user means them.
@@ -1010,7 +1266,7 @@ NEW MESSAGE:
                 return
             self._log(f"Merge model returned {len(changes)} change(s)", "info")
 
-            if self.valves.pii_filter_enabled and changes:
+            if self._pii_enabled() and changes:
                 pre_count = len(changes)
                 changes = await self._filter_facts_pii(changes)
                 if pre_count - len(changes) > 0:
@@ -1024,23 +1280,20 @@ NEW MESSAGE:
                 return
 
             counts = await asyncio.wait_for(
-                self._apply_changes(user_id, changes), timeout=30.0
+                self._apply_changes(user_id, changes, request, user), timeout=60.0
             )
             if not (counts["updated"] or counts["added"] or counts["removed"]):
-                self._log(
-                    f"No changes to facts ({len(existing_facts)} facts unchanged)",
-                    "info",
-                )
+                self._log(f"No changes to facts ({len(existing_facts)} candidates unchanged)", "info")
                 return
             self._log(
                 f"Memory updated for user {user_id[:8]}: "
-                f"{counts['updated']} updated, {counts['added']} added, {counts['removed']} removed "
-                f"({len(existing_facts)} stored before)",
+                f"{counts['updated']} updated, {counts['added']} added, {counts['removed']} removed, "
+                f"{counts['merged']} merged",
                 "info",
             )
 
         except asyncio.TimeoutError:
-            self._log("Memory update timed out after 30 seconds", "warning")
+            self._log("Memory update timed out after 60 seconds", "warning")
         except Exception as e:
             self._log(
                 f"Failed to update memory state: {type(e).__name__}: {e}", "error"
@@ -1049,92 +1302,11 @@ NEW MESSAGE:
 
             self._log(f"State update traceback: {traceback.format_exc()}", "error")
 
-    async def _select_relevant_memories(
-        self,
-        facts: List[Dict[str, Any]],
-        messages: List[Dict[str, str]],
-        user: Optional[Dict[str, Any]] = None,
-        request: Optional[Any] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Ask the relevance model which stored facts matter for the current
-        conversation. It answers with (type, subject) keys only; the stored
-        fact objects are injected unchanged. Facts whose type is in
-        always_inject_types bypass the model. Any failure falls back to all facts.
-        """
-        if not facts:
-            return []
-
-        always_facts = [
-            f for f in facts if f.get("type", "other") in self.valves.always_inject_types
-        ]
-        filterable_facts = [
-            f for f in facts if f.get("type", "other") not in self.valves.always_inject_types
-        ]
-        if not filterable_facts:
-            return always_facts
-
-        window = [m for m in messages[-6:] if m.get("role") in ("user", "assistant")]
-        recent_conversation = [
-            {"role": m.get("role"), "content": content_to_text(m.get("content"))}
-            for m in window
-        ]
-        candidates = [
-            {"type": f.get("type"), "subject": f.get("subject"), "value": f.get("value")}
-            for f in filterable_facts
-        ]
-        relevance_prompt = f"""STORED FACTS:
-{json.dumps(candidates, indent=2)}
-
-CURRENT CONVERSATION:
-{json.dumps(recent_conversation, indent=2)}"""
-
-        try:
-            payload = {
-                "model": self.valves.relevance_model_id,
-                "messages": [{"role": "user", "content": relevance_prompt}],
-                "stream": False,
-            }
-            response = await generate_chat_completion(
-                request=request,
-                form_data=payload,
-                user=user,
-                bypass_filter=True,
-            )
-            response_text = None
-            if isinstance(response, dict):
-                choices = response.get("choices", [])
-                if choices:
-                    response_text = choices[0].get("message", {}).get("content", "")
-            if not response_text:
-                self._log("Relevance model returned empty - falling back to all facts", "warning")
-                return facts
-
-            cleaned = self._clean_model_response(response_text)
-            if cleaned.startswith("```"):
-                lines = cleaned.split("\n")
-                cleaned = "\n".join(lines[1:-1] if len(lines) > 2 else lines)
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:].strip()
-            parsed = json.loads(cleaned)
-            picked = parsed.get("relevant", parsed.get("relevant_facts", []))
-            keys = {
-                _fact_key(k) for k in picked if isinstance(k, dict) and k.get("subject")
-            }
-            relevant = [f for f in filterable_facts if _fact_key(f) in keys]
-            self._log(
-                f"Relevance filter: {len(filterable_facts)} filterable -> {len(relevant)} relevant "
-                f"(+ {len(always_facts)} always-inject)",
-                "info",
-            )
-            return always_facts + relevant
-
-        except json.JSONDecodeError as e:
-            self._log(f"Relevance model returned invalid JSON: {e} - falling back to all facts", "warning")
-            return facts
-        except Exception as e:
-            self._log(f"Relevance filtering failed: {type(e).__name__}: {e} - falling back to all facts", "warning")
-            return facts
+    def _query_text(self, messages: List[Dict[str, Any]]) -> str:
+        """The search text: the last query_window_messages user/assistant messages."""
+        n = max(1, int(self.valves.query_window_messages))
+        window = [m for m in messages if m.get("role") in ("user", "assistant")][-n:]
+        return "\n".join(t for t in (content_to_text(m.get("content")) for m in window) if t)
 
     def _format_memory_context(self, facts: List[Dict[str, Any]]) -> str:
         """Render the selected facts grouped by type. Every type is rendered; no caps."""
@@ -1181,8 +1353,8 @@ CURRENT CONVERSATION:
         __request__: Optional[Request] = None,
     ) -> Dict[str, Any]:
         """
-        Inlet: read the user's facts, pick the relevant ones, append them to the
-        latest user message. No extraction here; that runs after the reply.
+        Inlet: embed the recent chat, pull the nearest facts, append them to the
+        latest user message. No model call; extraction runs after the reply.
         """
         self._log("=== INLET START ===", "info")
         if not __user__ or not __user__.get("id"):
@@ -1202,21 +1374,16 @@ CURRENT CONVERSATION:
 
         try:
             await status("🔍 Loading your memories...", False)
+            messages = body.get("messages", [])
             # Wait for a still-running extraction from the previous turn so the
             # newest facts are included.
             async with self._user_lock(user_id):
-                all_facts = await self._get_facts(user_id)
-            total_stored = len(all_facts)
-            self._log(f"Loaded {total_stored} facts", "info")
-
-            injected_facts = all_facts
-            messages = body.get("messages", [])
-            if self.valves.relevance_filter_enabled and all_facts and messages:
-                await status("🔎 Filtering relevant memories...", False)
-                injected_facts = await self._select_relevant_memories(
-                    all_facts, messages, user=user_obj, request=__request__
+                await self._init_store(__request__, user_obj)
+                injected_facts = await self._search_facts(
+                    user_id, self._query_text(messages), __request__, user_obj,
+                    threshold=self.valves.relevance_threshold, limit=self.valves.max_memories,
                 )
-                self._log(f"Relevance filter: {total_stored} total -> {len(injected_facts)} relevant", "info")
+            self._log(f"Retrieved {len(injected_facts)} facts", "info")
 
             memory_context = self._format_memory_context(injected_facts)
             if memory_context and messages:
@@ -1242,20 +1409,14 @@ CURRENT CONVERSATION:
                 body["messages"] = messages
 
             if injected_facts:
-                if self.valves.relevance_filter_enabled and len(injected_facts) < total_stored:
-                    await status(
-                        f"💭 Recalled {len(injected_facts)} of {total_stored} memories relevant to this chat",
-                        True,
-                    )
-                else:
-                    await status(f"💭 Recalled {len(injected_facts)} memories about you", True)
+                await status(f"💭 Recalled {len(injected_facts)} memories relevant to this chat", True)
             else:
                 await status("👋 Getting to know you...", True)
 
             self._log("=== INLET COMPLETE ===", "info")
         except ConnectionError as e:
-            self._log(f"PostgreSQL connection error: {e}", "error")
-            await status("⚠️ Cannot connect to memory database. Check PostgreSQL.", True)
+            self._log(f"Memory store error: {e}", "error")
+            await status("⚠️ Cannot open the memory database. Check postgres_url and the server log.", True)
         except ImportError as e:
             self._log(f"Missing dependencies: {e}", "error")
             await status("⚠️ Missing dependencies. Install: psycopg[binary]", True)

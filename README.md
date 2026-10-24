@@ -6,9 +6,10 @@
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 A persistent per-user memory for [Open WebUI](https://github.com/open-webui/open-webui): facts about the user are
-extracted by a small local model after each reply, stored in one PostgreSQL table, and the relevant ones are
-injected into the next request. LangGraph was removed on 2026-10-18 (see [Storage](#-storage)); the installed
-function id is `user_memory`.
+extracted by a small local model after each reply, stored in one PostgreSQL table with a pgvector embedding per
+fact, and the nearest ones are injected into the next request by vector search (reranked when Open WebUI has a
+reranker configured). Embeddings come from Open WebUI's own configured embedding model. LangGraph was removed on
+2026-10-18, the relevance model on 2026-10-24 (v7.0); the installed function id is `user_memory`.
 
 ## Author
 
@@ -18,10 +19,12 @@ function id is `user_memory`.
 ## ✨ Features
 
 - **Persistent Memory**: remembers identity, status, preferences, ownership, relationships, goals, skills and events
-- **Relevance filtering**: a second small model picks which facts matter for the current conversation
+- **Vector retrieval, no relevance model**: the recent chat is embedded and the nearest facts are injected, ordered by Open WebUI's reranker when one is configured; the inlet makes no model call
+- **De-duplication**: a new fact that is near-identical to an existing one of the same type (e.g. `job` vs `occupation`) updates that row instead of adding a second
+- **Embeddings follow Open WebUI**: the filter uses whatever embedding model Open WebUI has configured and re-embeds every fact automatically when that model or its dimension changes
 - **Reply never waits for extraction**: extraction runs after the reply as a background task
-- **PII Protection**: 3-layer defense-in-depth filtering prevents storage of phone numbers, SSNs, addresses, credit cards, and other personally identifiable information — while still storing personality traits, preferences, and ownership types
-- **One table**: `user_facts`, one row per fact keyed on user + type + subject, no framework, no checkpoint history
+- **PII Protection, optional**: `pii_engine` = `none` (store exactly what was extracted), `regex` (built-in patterns) or `pii_tracer` (local PII-Tracer server)
+- **One table**: `user_facts`, one row per fact keyed on user + type + subject plus its embedding, no framework, no checkpoint history
 
 ## 📁 Project Structure
 
@@ -31,26 +34,29 @@ openwebui-langgraph-memory-filter/      # folder name predates the LangGraph rem
 ├── filter/
 │   └── user_memory_filter.py    # The filter (installed copy = DB function user_memory)
 ├── docker/
-│   └── docker-compose.langgraph.yml  # PostgreSQL container (langgraph-postgres, db langgraph_memory)
+│   ├── docker-compose-langgraph-pgvector.yml  # PostgreSQL 16 + pgvector (langgraph-pgvector, db langgraph_memory)
+│   └── docker-compose.langgraph.yml           # The previous plain postgres:16 container (no vector extension)
 ├── docs/
 │   ├── EXTRACTION_MODEL_SETUP.md     # Extraction model configuration
 │   └── ...                           # Older design docs, each headed by a dated "superseded" note
 └── prompt/
     ├── MERGE_PROMPT_memory-manager.md  # System prompt of the memory-manager model (extraction)
-    ├── RELEVANCE_PROMPT.md             # System prompt of the memory-relevance model
     └── INSTRUCTIONS.md                 # Model setup walkthrough
 ```
 
 ## 🚀 Quick Start
 
-### 1. Start PostgreSQL
+### 1. Start PostgreSQL with pgvector
 
 ```bash
 cd docker
-docker-compose -f docker-compose.langgraph.yml up -d
+docker compose -f docker-compose-langgraph-pgvector.yml up -d
 ```
 
-The container, database and role keep their original `langgraph` names; only the table changed.
+The server must have the `vector` extension available (image `pgvector/pgvector:pg16`); the filter runs
+`CREATE EXTENSION IF NOT EXISTS vector` itself. Moving from the old plain `postgres:16` container: `pg_dump` the
+`langgraph_memory` database out of it and restore into the new one; the filter adds the embedding column and
+embeds every existing row on its first start. The database and role keep their `langgraph` names.
 
 ### 2. Install Dependencies
 
@@ -67,14 +73,18 @@ so the filter deliberately needs no extra package. Filter 5.1 and earlier needed
 3. Paste the contents of `filter/user_memory_filter.py`
 4. Save, enable the filter, and attach it to the models that should remember (model → Filters)
 
-### 4. Configure the two helper models
+### 4. Configure the helper model and the embedder
 
 See [docs/EXTRACTION_MODEL_SETUP.md](docs/EXTRACTION_MODEL_SETUP.md) and [prompt/INSTRUCTIONS.md](prompt/INSTRUCTIONS.md).
 
 Quick version:
-1. Create a workspace model `memory-manager` with the system prompt from `prompt/MERGE_PROMPT_memory-manager.md`
-2. Create a workspace model `memory-relevance` with the system prompt from `prompt/RELEVANCE_PROMPT.md`
-3. The filter's `extraction_model_id` and `relevance_model_id` valves default to those two ids
+1. Create a workspace model `memory-manager` with the system prompt from `prompt/MERGE_PROMPT_memory-manager.md`;
+   the filter's `extraction_model_id` valve defaults to that id.
+2. Embeddings and reranking are not configured in the filter. It uses what Open WebUI has under
+   **Admin Panel > Settings > Documents**: the embedding model (required) and the reranking model (optional; when set,
+   it orders the retrieved facts). Changing the embedding model later is fine: the filter notices on its next start and
+   re-embeds every fact.
+3. Set the `postgres_url` valve (see below). Nothing else is required.
 
 ## 📖 Documentation
 
@@ -101,8 +111,7 @@ docker-compose -f docker-compose.langgraph.yml up -d
 ```
 
 **Default Connection:**
-- Host: `localhost` (or `langgraph-postgres` from other containers)
-- Port: `5432`
+- Server: valve `postgres_url`, `scheme://host` or `scheme://host:port` (default port 5432), e.g. `http://langgraph-pgvector` or `http://10.5.10.100:5432`
 - Database: `langgraph_memory`
 - User: `langgraph`
 - Password: `langgraph_password_change_me`
@@ -115,18 +124,19 @@ see "How it works" below for what is fixed behaviour.
 | Valve | Default | Description |
 |-------|---------|-------------|
 | `priority` | `10` | Filter order in Open WebUI (lower runs first) |
-| `postgres_host` / `postgres_port` / `postgres_database` / `postgres_user` / `postgres_password` | `langgraph-postgres` / `5432` / `langgraph_memory` / `langgraph` / ... | Where the fact store lives |
+| `postgres_url` / `postgres_database` / `postgres_user` / `postgres_password` | (required) / `langgraph_memory` / `langgraph` / ... | Where the fact store lives. `postgres_url` is `scheme://host` or `scheme://host:port` (default port 5432), e.g. `http://langgraph-pgvector` or `http://10.5.10.100:5432`. The filter does not care how the database is deployed. |
 | `extraction_model_id` | `memory-manager` | Workspace model that returns fact changes (prompt: `prompt/MERGE_PROMPT_memory-manager.md`) |
-| `relevance_model_id` | `memory-relevance` | Workspace model that picks relevant facts (prompt: `prompt/RELEVANCE_PROMPT.md`) |
-| `relevance_filter_enabled` | `true` | Off = inject every stored fact |
-| `always_inject_types` | `["identity"]` | Fact types that skip the relevance model |
+| `query_window_messages` | `6` | How many of the most recent user/assistant messages are embedded as the search text. `1` = the latest user message only |
+| `relevance_threshold` | `0.45` | Minimum cosine similarity for a fact to be a candidate; `0` = no cutoff. Scale depends on the embedding model: with bge-m3 on short facts, unrelated facts measure 0.40-0.50 and on-topic ones 0.50-0.65 (2026-10-24), so cosine alone separates weakly and the reranker does the real ordering |
+| `max_memories` | `20` | Top N candidates injected (after reranking when Open WebUI has a reranker, by similarity otherwise), not counting `always_inject_types`; also how many nearest facts the extraction model sees. `0` = no cap |
+| `always_inject_types` | `["identity"]` | Fact types that are always injected, regardless of similarity |
+| `dedupe_threshold` | `0.9` | Similarity above which a new fact of the same type with a different subject wording updates the existing row instead of adding one (`job` vs `occupation` measured 0.951 with bge-m3). `1` = off |
 | `show_status` | `true` | Status line in the chat while memories load |
-| `pii_filter_enabled` | `true` | Enable PII detection and filtering |
+| `pii_engine` | `"regex"` | `none` stores facts exactly as extracted (no scrub, no check); `regex` = built-in patterns; `pii_tracer` = Perplexity's PII-Tracer model on a local server. `none` added in v7.0 |
 | `pii_filter_mode` | `"remove"` | `remove` drops facts with PII; `redact` stores with `[REDACTED]` |
-| `pii_scrub_input` | `true` | Scrub PII from messages before sending to extraction model |
+| `pii_scrub_input` | `true` | Scrub PII from messages before sending to extraction model (ignored with `none`) |
 | `pii_patterns_enabled` | all 10 | Which PII types the **regex** engine detects (see PII Protection section) |
-| `pii_engine` | `"regex"` | What finds the PII: `regex` (built-in patterns) or `pii_tracer` (Perplexity's PII-Tracer model on a local server). Added 2026-10-20, v6.1 |
-| `pii_tracer_url` | `http://10.5.10.100:8193` | PII-Tracer server; only used with `pii_engine = pii_tracer` |
+| `pii_tracer_url` | (empty) | PII-Tracer server URL, e.g. `http://pii-tracer:8193`; required with `pii_engine = pii_tracer`, unused otherwise. An empty URL counts as "server down" and `pii_tracer_fallback` applies |
 | `pii_tracer_timeout` | `15` | Seconds per server call |
 | `pii_tracer_labels` | 7 of 9 | Model labels treated as PII on the memory path. `private_person` and `private_date` are left out by default so names and birthdays stay storable as identity facts |
 | `pii_tracer_fallback` | `"regex"` | Server down or timing out: `regex` uses the patterns for that update, `allow` treats the text as clean |
@@ -134,27 +144,38 @@ see "How it works" below for what is fixed behaviour.
 
 Per-user valves: `enabled`, `show_status`.
 
-Reply length of the two helper models is set on their workspace presets (`max_tokens`), not by the filter.
+Reply length of the helper model is set on its workspace preset (`max_tokens`), not by the filter.
 
-## ⚙️ How it works (2026-10-18)
+## ⚙️ How it works (2026-10-24, v7.0)
 
-**Inlet** (before the chat model sees the request):
-1. Read the user's facts from PostgreSQL (waits for a still-running extraction from the previous turn).
-2. Send the non-identity facts as `{type, subject, value}` plus the last 6 messages to `memory-relevance`, which
-   answers with the `{type, subject}` keys it picked. Identity facts always pass. Any failure injects all facts.
-3. Render the picked facts grouped by type and append them to the latest user message (see next section).
+**Inlet** (before the chat model sees the request; no model call):
+1. First use only: open the store, create the extension/tables, and check the stored embedding model and
+   dimension against Open WebUI's current one; on any difference, rebuild the `embedding` column and re-embed every row.
+2. Embed the last `query_window_messages` user/assistant messages as one search text (waits for a still-running
+   extraction from the previous turn).
+3. `SELECT` the user's `always_inject_types` facts, plus the nearest other facts by cosine distance
+   (`embedding <=> query`) with similarity ≥ `relevance_threshold`. When Open WebUI has a reranker configured
+   (`request.app.state.RERANKING_FUNCTION`), the candidates are rescored by it; the top `max_memories` are kept.
+4. Render the facts grouped by type and append them to the latest user message (see next section).
 
-**Outlet** (after the reply is streamed): schedule a background task, return immediately. The task sends
-`memory-manager` today's date, the stored facts, the previous 3 user messages as context and the latest user message, and asks
+**Outlet** (after the reply is streamed): schedule a background task, return immediately. The task embeds the
+(scrubbed) latest user message and sends `memory-manager` today's date, the `always_inject_types` facts plus the
+`max_memories` nearest existing facts, the previous 3 user messages as context and the latest user message, and asks
 only for what changes: new facts, updated facts (same type+subject), and `"remove": true` entries. Nothing changes
-on most turns and the reply is `{"facts": []}`. Each change is applied to its own row (omitted facts are
-kept, removal is a `DELETE`, a fact identical to the stored one is not written). Empty or unparseable replies write nothing.
+on most turns and the reply is `{"facts": []}`. Each change is embedded (`subject: value`) and applied to its own row:
+removal is a `DELETE`; a new `(type, subject)` whose embedding is ≥ `dedupe_threshold` similar to an existing fact of
+the same type is applied to that row instead (logged as *merged*); otherwise `INSERT ... ON CONFLICT` writes value,
+sentiment, confidence and embedding only when something differs. Empty or unparseable replies write nothing.
 A per-user lock serialises the task with the next inlet. Only user messages are sent; system prompts carry persona
 text that would be misread as facts.
 
-Measured before this change (2026-10-16 to 10-18, 43 turns): the inlet blocked each reply for a median 36.5 s
-(extraction 27 s, because the model echoed all 15 facts every turn; relevance 10 s, because it copied full
-fact objects back). Both are now out of the reply path or reduced to key lists.
+**Storage**: table `user_facts` (`user_id, type, subject, value, sentiment, confidence, first_mentioned,
+last_updated, embedding vector(N)`, primary key user + type + subject, HNSW cosine index when N ≤ 2000) and
+`user_facts_meta` (one row: `embedding_model`, `embedding_dim`). N is whatever Open WebUI's embedding model returns.
+
+Measured before 2026-10-18 (43 turns): the inlet blocked each reply for a median 36.5 s (extraction 27 s,
+relevance 10 s). Since 2026-10-18 extraction is off the reply path; since 2026-10-24 the inlet makes no model call at
+all (one embedding call, one SQL query, an optional reranker call).
 
 ## 📍 Where the memories are injected (2026-10-16)
 
@@ -194,7 +215,7 @@ docker exec -it langgraph-postgres psql -U langgraph -d langgraph_memory -c \
    WHERE user_id = '<user id>' AND type = 'identity' AND subject = 'age';"
 ```
 
-### PII engine offline test (v6.1)
+### PII engine offline test (v7.0)
 `tests/test_pii_engine.py` fakes the PII-Tracer server, the extraction model and the database and checks both engines, the
 label defaults (names kept), remove/redact, both fallbacks, and one whole background update. Run it inside the Open WebUI
 container (it has psycopg, aiohttp and open_webui):
@@ -225,10 +246,12 @@ What counts as PII is decided by the engine chosen with `pii_engine` (below).
 ### Layer 3: Post-Extraction Validation
 Every extracted fact is scanned for PII in both `subject` and `value` fields, plus a subject blocklist. Facts with PII are either dropped or redacted based on config. Same engine as layer 2.
 
-### The two engines (`pii_engine`, since v6.1, 2026-10-20)
+### The three settings (`pii_engine`; `regex`/`pii_tracer` since v6.1, `none` since v7.0)
 
+- **`none`**: no pre-scrub and no post-check; facts are stored exactly as the extraction model returns them. For
+  setups that do not want any PII handling in the memory path.
 - **`regex`** (default): the ten built-in patterns in the table below, selectable with `pii_patterns_enabled`. No network, no model, no names: a pattern cannot tell a person's name from any other words, so names were never matched and identity facts survive.
-- **`pii_tracer`**: [PII-Tracer](https://huggingface.co/perplexity-ai/PII-Tracer), Perplexity's 0.6B PII detector, running as a local server (on this Mac: `local-llm-config/pii-tracer`, `llmctl start pii`, port 8193; the companion `openwebui-pii-tracer-filter` uses the same server for the chat path). It reads context, so it also finds account numbers, secrets, addresses and other values that have no fixed shape. Each pre-scrubbed message and each extracted fact's subject and value is one call to `POST /v1/pii/detect`; findings whose label is in `pii_tracer_labels` are redacted. By default `private_person` and `private_date` are **not** in that list, so "name = Beau" or a birthday is still stored, as with the regex engine; add them for a memory that keeps no names at all. With the model engine the log names the label of a blocked fact, never the matched text (the regex engine's log lines are unchanged and still quote the match). If the server cannot be reached, `pii_tracer_fallback` decides: `regex` (default) runs the patterns for that update and logs the failure once, `allow` treats the text as clean.
+- **`pii_tracer`**: [PII-Tracer](https://huggingface.co/perplexity-ai/PII-Tracer), Perplexity's 0.6B PII detector, running as a local server (set its URL in `pii_tracer_url`; the companion `openwebui-pii-tracer-filter` can use the same server for the chat path, but the two filters are independent of each other). It reads context, so it also finds account numbers, secrets, addresses and other values that have no fixed shape. Each pre-scrubbed message and each extracted fact's subject and value is one call to `POST /v1/pii/detect`; findings whose label is in `pii_tracer_labels` are redacted. By default `private_person` and `private_date` are **not** in that list, so "name = Beau" or a birthday is still stored, as with the regex engine; add them for a memory that keeps no names at all. With the model engine the log names the label of a blocked fact, never the matched text (the regex engine's log lines are unchanged and still quote the match). If the server cannot be reached, `pii_tracer_fallback` decides: `regex` (default) runs the patterns for that update and logs the failure once, `allow` treats the text as clean.
 
 Switching engines does not touch stored facts; it only changes what the next updates scrub and block.
 

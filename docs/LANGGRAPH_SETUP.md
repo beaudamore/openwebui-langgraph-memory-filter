@@ -1,6 +1,6 @@
 # LangGraph Memory Filter - Enterprise Setup Guide
 
-> **2026-10-18:** Superseded in part. The filter no longer has `SCHEMA_VERSION`/`schema_migrations`, the valves `extraction_threshold`, `max_injected_memories`, `memory_injection_format`, `show_injected_memories`, `merge_mode`, `memory_injection_position`, `max_message_chars`, `extraction_model_max_tokens`, `relevance_model_max_tokens`, or the summary node. Extraction runs in the outlet as a background task and asks only for changed facts. The installed prompt is `prompt/MERGE_PROMPT_memory-manager.md`; `EXTRACTION_PROMPT.md` was removed.  **Later the same day LangGraph was removed entirely:** the filter is now `filter/user_memory_filter.py`, installed as function `user_memory`, storing one row per fact in table `user_facts` (one row per user with a JSONB list until 2026-10-19); the checkpoint tables are gone. See the README for current behaviour.
+> **2026-10-18:** Superseded in part. The filter no longer has `SCHEMA_VERSION`/`schema_migrations`, the valves `extraction_threshold`, `max_injected_memories`, `memory_injection_format`, `show_injected_memories`, `merge_mode`, `memory_injection_position`, `max_message_chars`, `extraction_model_max_tokens`, `relevance_model_max_tokens`, or the summary node. Extraction runs in the outlet as a background task and asks only for changed facts. The installed prompt is `prompt/MERGE_PROMPT_memory-manager.md`; `EXTRACTION_PROMPT.md` was removed.  **Later the same day LangGraph was removed entirely:** the filter is now `filter/user_memory_filter.py`, installed as function `user_memory`, storing one row per fact in table `user_facts` (one row per user with a JSONB list until 2026-10-19); the checkpoint tables are gone. See the README for current behaviour. **2026-10-24 (v7.0):** PostgreSQL now needs the pgvector extension (`docker/docker-compose-langgraph-pgvector.yml`); the relevance model and its valves are gone (vector search + Open WebUI's reranker instead); `pii_filter_enabled` is gone (`pii_engine = none`); the connection valve is `postgres_url`.
 
 
 > **For AI Assistants:** If you're modifying this filter, read [AI_DEVELOPMENT_GUIDE.md](AI_DEVELOPMENT_GUIDE.md) first!
@@ -41,7 +41,7 @@ Enterprise-grade graph-based memory system using LangGraph with PostgreSQL for:
                        │ Port 5432
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              PostgreSQL Container (postgres:16)              │
+│        PostgreSQL Container (pgvector/pgvector:pg16)         │
 │                                                               │
 │  • LangGraph checkpoints (graph states)                      │
 │  • User memory metadata                                      │
@@ -172,7 +172,7 @@ docker exec -it <your-openwebui-container-name> ls -la /app/backend/data/functio
    - Quick start: Set `extraction_model_id` to an existing model (e.g., `llama3.2:latest`)
    - Recommended: Create a custom model with extraction system prompt
 5. Configure other valves:
-   - `postgres_host`: `langgraph-postgres` (if using docker-compose network)
+   - `postgres_url`: `scheme://host` or `scheme://host:port`, e.g. `http://10.5.10.100:5432` (required)
    - `postgres_password`: Change from default!
    - Other settings as desired
 
@@ -234,8 +234,7 @@ See [AI_DEVELOPMENT_GUIDE.md](AI_DEVELOPMENT_GUIDE.md) for detailed instructions
 
 | Valve | Default | Description |
 |-------|---------|-------------|
-| `postgres_host` | `langgraph-postgres` | PostgreSQL hostname |
-| `postgres_port` | `5432` | PostgreSQL port |
+| `postgres_url` | (empty, required) | `scheme://host` or `scheme://host:port` (default port 5432), e.g. `http://langgraph-pgvector` |
 | `postgres_database` | `langgraph_memory` | Database name |
 | `postgres_user` | `langgraph` | Database user |
 | `postgres_password` | ⚠️ **CHANGE ME** | Database password |
@@ -261,7 +260,7 @@ See [AI_DEVELOPMENT_GUIDE.md](AI_DEVELOPMENT_GUIDE.md) for detailed instructions
 
 | Valve | Default | Description |
 |-------|---------|-------------|
-| `pii_filter_enabled` | `true` | Enable 3-layer PII detection and filtering |
+| `pii_engine` | `regex` | `none` / `regex` / `pii_tracer`; `none` stores facts unchecked |
 | `pii_filter_mode` | `"remove"` | `"remove"` drops facts with PII; `"redact"` stores with `[REDACTED]` |
 | `pii_scrub_input` | `true` | Scrub PII from messages before sending to extraction model |
 | `pii_patterns_enabled` | all 10 | Which PII types to detect: ssn, credit_card, phone, email, street_address, passport, drivers_license, bank_account, dob, ip_address |
@@ -455,7 +454,7 @@ SELECT count(*) FROM pg_stat_activity WHERE datname = 'langgraph_memory';
    - 3-layer defense: prompt guardrails + regex pre-scrub + post-extraction validation
    - Detects SSN, credit cards, phone numbers, email, street addresses, passport, driver's license, bank accounts, DOB, IP addresses
    - Stores personality traits, preferences, ownership types — never raw PII
-   - Configure via `pii_filter_enabled`, `pii_filter_mode`, `pii_scrub_input`, `pii_patterns_enabled` valves
+   - Configure via `pii_engine`, `pii_filter_mode`, `pii_scrub_input`, `pii_patterns_enabled` valves
 
 ---
 
@@ -520,7 +519,7 @@ VACUUM ANALYZE;
 1. **Connection Pooling:**
    ```python
    # Use pgbouncer for connection pooling
-   postgres_host: "pgbouncer"  # Instead of direct postgres
+   postgres_url: "http://pgbouncer"  # Instead of direct postgres
    ```
 
 2. **Read Replicas:**
